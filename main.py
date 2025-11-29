@@ -1,20 +1,27 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import uuid
 from pymongo import MongoClient
+import os
+import uuid
+from dotenv import load_dotenv
+
+# โหลด environment variables
+load_dotenv()
 
 app = FastAPI(title="CF AutoText License Server")
 
 # -------------------------
-# MongoDB Config
+# MongoDB Setup
 # -------------------------
-MONGO_URI = "mongodb://localhost:27017"  # เปลี่ยนตาม MongoDB ของคุณ
-DB_NAME = "cf_autotext"
-COLLECTION_NAME = "licenses"
+MONGO_URI = os.getenv("MONGO_URI")
+DB_NAME = os.getenv("DB_NAME", "cf_license_db")
+
+if not MONGO_URI:
+    raise Exception("MONGO_URI not set in environment variables")
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
-collection = db[COLLECTION_NAME]
+collection = db["licenses"]
 
 # -------------------------
 # Models
@@ -29,7 +36,7 @@ class UsernameModel(BaseModel):
     username: str
 
 # -------------------------
-# Helper functions
+# License helpers
 # -------------------------
 def gen_license_key():
     return uuid.uuid4().hex[:16].upper()
@@ -37,16 +44,22 @@ def gen_license_key():
 # -------------------------
 # API Endpoints
 # -------------------------
+@app.get("/")
+def root():
+    return {"message": "Server is running!"}
+
 @app.get("/users/list")
 def list_users():
-    users = list(collection.find({}, {"_id": 0}))
-    return {"users": users}
+    try:
+        users = list(collection.find({}, {"_id": 0}))
+        return {"users": users}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/users/gen_license")
 def gen_license(user: UsernameModel):
-    existing = collection.find_one({"username": user.username})
-    if existing:
-        raise HTTPException(400, "User มีอยู่แล้ว")
+    if collection.find_one({"username": user.username}):
+        raise HTTPException(status_code=400, detail="User มีอยู่แล้ว")
     license_key = gen_license_key()
     collection.insert_one({
         "username": user.username,
@@ -60,22 +73,26 @@ def gen_license(user: UsernameModel):
 def delete_user(user: UsernameModel):
     result = collection.delete_one({"username": user.username})
     if result.deleted_count == 0:
-        raise HTTPException(400, "User ไม่พบ")
+        raise HTTPException(status_code=400, detail="User ไม่พบ")
     return {"status": "success", "message": f"User {user.username} ลบแล้ว"}
 
 @app.post("/check_license")
 def check_license(req: LicenseCheck):
     u = collection.find_one({"username": req.username, "license": req.license})
+
     if not u:
         return {"status": "invalid", "message": "License ไม่ถูกต้อง"}
 
-    if u["status"] != "active":
+    if u.get("status") != "active":
         return {"status": "invalid", "message": f"License {u['status']}"}
 
     # HWID binding
-    if u.get("hwid", "") == "":
-        collection.update_one({"username": req.username}, {"$set": {"hwid": req.hwid}})
-    elif u["hwid"] != req.hwid:
+    if not u.get("hwid"):
+        collection.update_one(
+            {"username": req.username},
+            {"$set": {"hwid": req.hwid}}
+        )
+    elif u.get("hwid") != req.hwid:
         return {"status": "invalid", "message": "HWID ไม่ตรง"}
 
     return {"status": "valid", "message": "License ถูกต้อง"}
