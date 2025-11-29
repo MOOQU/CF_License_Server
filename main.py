@@ -1,23 +1,15 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
-import os
 import uuid
-from dotenv import load_dotenv
-
-# โหลด environment variables
-load_dotenv()
 
 app = FastAPI(title="CF AutoText License Server")
 
 # -------------------------
-# MongoDB Setup
+# MongoDB Setup (ใส่ URI ตรงนี้)
 # -------------------------
-MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = os.getenv("DB_NAME", "cf_license_db")
-
-if not MONGO_URI:
-    raise Exception("MONGO_URI not set in environment variables")
+MONGO_URI = "mongodb+srv://MOOQU:Auan19492@cluster0.updjdl2.mongodb.net/?retryWrites=true&w=majority"
+DB_NAME = "cf_license_db"
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
