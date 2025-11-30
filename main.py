@@ -6,7 +6,7 @@ import uuid
 app = FastAPI(title="CF AutoText License Server")
 
 # -------------------------
-# MongoDB Setup (ใส่ URI ตรงนี้)
+# MongoDB Setup
 # -------------------------
 MONGO_URI = "mongodb+srv://MOOQU:Auan19492@cluster0.updjdl2.mongodb.net/?appName=Cluster0"
 DB_NAME = "cf_license_db"
@@ -28,7 +28,7 @@ class UsernameModel(BaseModel):
     username: str
 
 # -------------------------
-# License helpers
+# License Helper
 # -------------------------
 def gen_license_key():
     return uuid.uuid4().hex[:16].upper()
@@ -40,6 +40,7 @@ def gen_license_key():
 def root():
     return {"message": "Server is running!"}
 
+# ===== USERS LIST =====
 @app.get("/users/list")
 def list_users():
     try:
@@ -48,6 +49,12 @@ def list_users():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# alias ให้เรียก /user/list ได้ด้วย
+@app.get("/user/list")
+def list_users_alias():
+    return list_users()
+
+# ===== GENERATE LICENSE =====
 @app.post("/users/gen_license")
 def gen_license(user: UsernameModel):
     if collection.find_one({"username": user.username}):
@@ -61,6 +68,7 @@ def gen_license(user: UsernameModel):
     })
     return {"status": "success", "username": user.username, "license": license_key}
 
+# ===== DELETE USER =====
 @app.post("/users/delete")
 def delete_user(user: UsernameModel):
     result = collection.delete_one({"username": user.username})
@@ -68,6 +76,7 @@ def delete_user(user: UsernameModel):
         raise HTTPException(status_code=400, detail="User ไม่พบ")
     return {"status": "success", "message": f"User {user.username} ลบแล้ว"}
 
+# ===== CHECK LICENSE =====
 @app.post("/check_license")
 def check_license(req: LicenseCheck):
     u = collection.find_one({"username": req.username, "license": req.license})
