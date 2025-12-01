@@ -1,0 +1,141 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from pymongo import MongoClient
+import uuid
+import time
+
+app = FastAPI(title=CF AutoText License Server)
+
+# -------------------------
+# MongoDB Setup
+# -------------------------
+MONGO_URI = mongodb+srvMOOQUSIRIMEEMAK@cluster0.crufku8.mongodb.netcf_license_dbretryWrites=true&w=majority
+DB_NAME = cf_license_db
+
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+collection = db[licenses]
+
+# -------------------------
+# Models
+# -------------------------
+class LicenseCheck(BaseModel)
+    username str
+    license str
+    hwid str
+    version str
+
+class UsernameModel(BaseModel)
+    username str
+
+class HWIDModel(BaseModel)
+    hwid str
+
+# -------------------------
+# License Helper
+# -------------------------
+def gen_license_key()
+    return uuid.uuid4().hex[16].upper()
+
+# -------------------------
+# API Endpoints
+# -------------------------
+@app.get()
+def root()
+    return {message Server is running!}
+
+# ===== USERS LIST =====
+@app.get(userslist)
+def list_users()
+    try
+        users = list(collection.find({}, {_id 0}))
+        return {users users}
+    except Exception as e
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ===== GENERATE LICENSE =====
+@app.post(usersgen_license)
+def gen_license(user UsernameModel)
+    if collection.find_one({username user.username})
+        raise HTTPException(status_code=400, detail=User มีอยู่แล้ว)
+    license_key = gen_license_key()
+    now = int(time.time())
+    collection.insert_one({
+        username user.username,
+        license license_key,
+        status active,
+        hwid ,
+        banned False,
+        trial True,
+        trial_start now,
+        total_usage_sec 0,
+        last_heartbeat now
+    })
+    return {status success, username user.username, license license_key}
+
+# ===== DELETE USER =====
+@app.post(usersdelete)
+def delete_user(user UsernameModel)
+    result = collection.delete_one({username user.username})
+    if result.deleted_count == 0
+        raise HTTPException(status_code=400, detail=User ไม่พบ)
+    return {status success, message fUser {user.username} ลบแล้ว}
+
+# ===== CHECK LICENSE =====
+TRIAL_LIMIT_SEC = 26060  # 2 ชั่วโมงทดลองใช้
+
+@app.post(check_license)
+def check_license(req LicenseCheck)
+    u = collection.find_one({username req.username, license req.license})
+
+    if not u
+        return {status invalid, message License ไม่ถูกต้อง}
+
+    if u.get(banned)
+        return {status invalid, message License ถูกบล็อค (Banned)}
+
+    # HWID binding
+    if not u.get(hwid)
+        collection.update_one(
+            {username req.username},
+            {$set {hwid req.hwid}}
+        )
+    elif u.get(hwid) != req.hwid
+        return {status invalid, message HWID ไม่ตรง}
+
+    now = int(time.time())
+    # คำนวณ trial
+    if u.get(trial, False)
+        elapsed = now - u.get(trial_start, now)
+        if elapsed  TRIAL_LIMIT_SEC
+            collection.update_one({username req.username}, {$set {trial False}})
+            return {status invalid, message หมดเวลาทดลองใช้}
+        # อัปเดต total_usage
+        last = u.get(last_heartbeat, now)
+        total = u.get(total_usage_sec, 0) + (now - last)
+        collection.update_one({username req.username},
+                              {$set {total_usage_sec total, last_heartbeat now}})
+
+    return {status valid, message License ถูกต้อง}
+
+# ===== BAN  UNBAN =====
+@app.post(ban)
+def ban_device(data HWIDModel)
+    result = collection.update_one({hwid data.hwid}, {$set {banned True}})
+    if result.matched_count == 0
+        raise HTTPException(status_code=404, detail=HWID ไม่พบ)
+    return {status success, message f{data.hwid} ถูกบล็อคเรียบร้อย}
+
+@app.post(unban)
+def unban_device(data HWIDModel)
+    result = collection.update_one({hwid data.hwid}, {$set {banned False}})
+    if result.matched_count == 0
+        raise HTTPException(status_code=404, detail=HWID ไม่พบ)
+    return {status success, message f{data.hwid} ถูกปลดบล็อคเรียบร้อย}
+
+@app.post(check_ban)
+def check_ban(data HWIDModel)
+    u = collection.find_one({hwid data.hwid})
+    if not u
+        raise HTTPException(status_code=404, detail=HWID ไม่พบ)
+    return {hwid data.hwid, banned u.get(banned, False)}
