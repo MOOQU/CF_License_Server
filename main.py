@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
 import uuid
+import time
 
 app = FastAPI(title="CF AutoText License Server")
 
@@ -52,23 +53,23 @@ def list_users():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/user/list")  # alias
-def list_users_alias():
-    return list_users()
-
 # ===== GENERATE LICENSE =====
 @app.post("/users/gen_license")
 def gen_license(user: UsernameModel):
     if collection.find_one({"username": user.username}):
         raise HTTPException(status_code=400, detail="User มีอยู่แล้ว")
     license_key = gen_license_key()
+    now = int(time.time())
     collection.insert_one({
         "username": user.username,
         "license": license_key,
         "status": "active",
         "hwid": "",
         "banned": False,
-        "user_type": "licensed"  # แยก trial/licensed
+        "trial": True,
+        "trial_start": now,
+        "total_usage_sec": 0,
+        "last_heartbeat": now
     })
     return {"status": "success", "username": user.username, "license": license_key}
 
@@ -81,15 +82,14 @@ def delete_user(user: UsernameModel):
     return {"status": "success", "message": f"User {user.username} ลบแล้ว"}
 
 # ===== CHECK LICENSE =====
+TRIAL_LIMIT_SEC = 2*60*60  # 2 ชั่วโมงทดลองใช้
+
 @app.post("/check_license")
 def check_license(req: LicenseCheck):
     u = collection.find_one({"username": req.username, "license": req.license})
 
     if not u:
         return {"status": "invalid", "message": "License ไม่ถูกต้อง"}
-
-    if u.get("status") != "active":
-        return {"status": "invalid", "message": f"License {u['status']}"}
 
     if u.get("banned"):
         return {"status": "invalid", "message": "License ถูกบล็อค (Banned)"}
@@ -103,9 +103,22 @@ def check_license(req: LicenseCheck):
     elif u.get("hwid") != req.hwid:
         return {"status": "invalid", "message": "HWID ไม่ตรง"}
 
+    now = int(time.time())
+    # คำนวณ trial
+    if u.get("trial", False):
+        elapsed = now - u.get("trial_start", now)
+        if elapsed > TRIAL_LIMIT_SEC:
+            collection.update_one({"username": req.username}, {"$set": {"trial": False}})
+            return {"status": "invalid", "message": "หมดเวลาทดลองใช้"}
+        # อัปเดต total_usage
+        last = u.get("last_heartbeat", now)
+        total = u.get("total_usage_sec", 0) + (now - last)
+        collection.update_one({"username": req.username},
+                              {"$set": {"total_usage_sec": total, "last_heartbeat": now}})
+
     return {"status": "valid", "message": "License ถูกต้อง"}
 
-# ===== BAN / UNBAN / CHECK =====
+# ===== BAN / UNBAN =====
 @app.post("/ban")
 def ban_device(data: HWIDModel):
     result = collection.update_one({"hwid": data.hwid}, {"$set": {"banned": True}})
