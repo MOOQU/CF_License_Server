@@ -67,8 +67,7 @@ def gen_license(user: UsernameModel):
         "license": license_key,
         "status": "active",
         "hwid": "",
-        "banned": False,
-        "user_type": "licensed"  # แยก trial/licensed
+        "banned": False
     })
     return {"status": "success", "username": user.username, "license": license_key}
 
