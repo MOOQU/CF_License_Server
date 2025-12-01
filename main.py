@@ -31,13 +31,20 @@ class UsernameModel(BaseModel):
 class HWIDModel(BaseModel):
     hwid: str
 
-# -------------------------
-# Constants / Helpers
-# -------------------------
-TRIAL_LIMIT_SEC = 2 * 3600  # 2 ชั่วโมงทดลองใช้
+class ReportStatusModel(BaseModel):
+    username: str = None
+    hwid: str
+    mode: str                  # "trial" หรือ "licensed"
+    remaining: int = None
+    version: str
 
+# -------------------------
+# License Helper
+# -------------------------
 def gen_license_key():
     return uuid.uuid4().hex[:16].upper()
+
+TRIAL_LIMIT_SEC = 2 * 60 * 60  # 2 ชั่วโมง
 
 # -------------------------
 # API Endpoints
@@ -47,13 +54,19 @@ def root():
     return {"message": "Server is running!"}
 
 # ===== USERS LIST =====
-@app.get("/users/list")
+@app.get("/users/list")  # แก้ให้ตรงกับ GUI
 def list_users():
-    users = list(collection.find({}, {"_id": 0}))
-    for u in users:
-        u["user_type"] = "trial" if u.get("trial", True) else "licensed"
-        u["status"] = "BANNED" if u.get("banned", False) else u.get("status", "active")
-    return {"users": users}
+    try:
+        users = list(collection.find({}, {"_id": 0}))
+        # แปลง trial เป็น user_type สำหรับ GUI
+        for u in users:
+            if u.get("trial", False):
+                u["user_type"] = "trial"
+            else:
+                u["user_type"] = "licensed"
+        return {"users": users}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ===== GENERATE LICENSE =====
 @app.post("/users/gen_license")
@@ -69,6 +82,7 @@ def gen_license(user: UsernameModel):
         "hwid": "",
         "banned": False,
         "trial": True,
+        "user_type": "trial",       # <-- เพิ่มตรงนี้
         "trial_start": now,
         "total_usage_sec": 0,
         "last_heartbeat": now
@@ -89,24 +103,26 @@ def check_license(req: LicenseCheck):
     u = collection.find_one({"username": req.username, "license": req.license})
     if not u:
         return {"status": "invalid", "message": "License ไม่ถูกต้อง"}
+
     if u.get("banned"):
         return {"status": "invalid", "message": "License ถูกบล็อค (Banned)"}
 
     # HWID binding
     if not u.get("hwid"):
-        collection.update_one({"username": req.username}, {"$set": {"hwid": req.hwid}})
+        collection.update_one(
+            {"username": req.username},
+            {"$set": {"hwid": req.hwid}}
+        )
     elif u.get("hwid") != req.hwid:
         return {"status": "invalid", "message": "HWID ไม่ตรง"}
 
     now = int(time.time())
-
-    # Trial check
+    # คำนวณ trial
     if u.get("trial", False):
         elapsed = now - u.get("trial_start", now)
         if elapsed > TRIAL_LIMIT_SEC:
-            collection.update_one({"username": req.username}, {"$set": {"trial": False}})
+            collection.update_one({"username": req.username}, {"$set": {"trial": False, "user_type": "licensed"}})
             return {"status": "invalid", "message": "หมดเวลาทดลองใช้"}
-
         # อัปเดต total_usage
         last = u.get("last_heartbeat", now)
         total = u.get("total_usage_sec", 0) + (now - last)
@@ -114,6 +130,38 @@ def check_license(req: LicenseCheck):
                               {"$set": {"total_usage_sec": total, "last_heartbeat": now}})
 
     return {"status": "valid", "message": "License ถูกต้อง"}
+
+# ===== CHECK TRIAL =====
+@app.post("/check_trial")
+def check_trial(data: HWIDModel):
+    now = int(time.time())
+    u = collection.find_one({"hwid": data.hwid})
+    
+    if not u:
+        # สร้าง trial ใหม่สำหรับ HWID ที่ไม่เคยมี
+        collection.insert_one({
+            "hwid": data.hwid,
+            "trial": True,
+            "user_type": "trial",      # <-- เพิ่มตรงนี้
+            "trial_start": now,
+            "total_usage_sec": 0,
+            "last_heartbeat": now,
+            "banned": False
+        })
+        return {"status": "active", "remaining": TRIAL_LIMIT_SEC}
+
+    if u.get("banned"):
+        return {"status": "banned", "remaining": 0, "message": "อุปกรณ์ถูกบล็อค"}
+
+    if u.get("trial", False):
+        elapsed = now - u.get("trial_start", now)
+        remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
+        if remaining <= 0:
+            collection.update_one({"hwid": data.hwid}, {"$set": {"trial": False, "user_type": "licensed"}})
+            return {"status": "expired", "remaining": 0, "message": "หมดเวลาทดลองใช้"}
+        return {"status": "active", "remaining": remaining}
+
+    return {"status": "inactive", "remaining": 0, "message": "ไม่ได้ใช้ trial"}
 
 # ===== BAN / UNBAN =====
 @app.post("/ban")
@@ -136,3 +184,23 @@ def check_ban(data: HWIDModel):
     if not u:
         raise HTTPException(status_code=404, detail="HWID ไม่พบ")
     return {"hwid": data.hwid, "banned": u.get("banned", False)}
+
+# ===== REPORT STATUS TO ADMIN =====
+@app.post("/report_status")
+def report_status(data: ReportStatusModel):
+    now = int(time.time())
+    query = {"hwid": data.hwid}
+    update = {
+        "$set": {
+            "last_seen": now,
+            "mode": data.mode,
+            "version": data.version
+        }
+    }
+    if data.mode == "trial" and data.remaining is not None:
+        update["$set"]["trial_remaining"] = data.remaining
+    if data.username:
+        update["$set"]["username"] = data.username
+
+    collection.update_one(query, update, upsert=True)
+    return {"status": "success"}
