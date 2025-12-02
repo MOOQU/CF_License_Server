@@ -62,23 +62,6 @@ def get_next_trial_id():
     meta.update_one({"_id": "trial_counter"}, {"$set": {"value": new_val}})
     return new_val
 
-def update_trial_elapsed(hwid):
-    """รวมเวลา session ถ้ามี last_start_time และ offline เกิน ONLINE_THRESHOLD"""
-    now = int(time.time())
-    u = collection.find_one({"hwid": hwid})
-    if not u or not u.get("trial"):
-        return
-    last_start = u.get("last_start_time")
-    last_seen = u.get("last_seen", now)
-    if last_start and now - last_seen > ONLINE_THRESHOLD:
-        # session หยุดโดย client offline
-        elapsed = now - last_start
-        total = u.get("total_usage_sec", 0) + elapsed
-        collection.update_one(
-            {"hwid": hwid},
-            {"$set": {"total_usage_sec": total, "last_start_time": None}}
-        )
-
 # -------------------------
 # API
 # -------------------------
@@ -99,11 +82,9 @@ def userslist():
 
         # Trial remaining
         if u.get("trial", False):
-            # รวมเวลาที่ใช้งานจริง + กำลังรันอยู่ตอนนี้
             elapsed = u.get("total_usage_sec", 0)
-            last_start = u.get("last_start_time")
-            if last_start:
-                elapsed += now - last_start
+            if u.get("last_start_time"):
+                elapsed += now - u["last_start_time"]
             u["trial_remaining_minutes"] = max(0, (TRIAL_LIMIT_SEC - elapsed) // 60)
         else:
             u["trial_remaining_minutes"] = "-"
@@ -172,9 +153,6 @@ def request_trial(data: TrialRequestModel):
 
     u = collection.find_one({"hwid": hwid})
     
-    # รวมเวลาที่ใช้จริงถ้า session เก่า
-    update_trial_elapsed(hwid)
-
     # สร้าง trial ใหม่
     if not u:
         tid = get_next_trial_id()
@@ -204,9 +182,8 @@ def request_trial(data: TrialRequestModel):
     # ยังอยู่ใน trial
     if u.get("trial"):
         elapsed = u.get("total_usage_sec", 0)
-        last_start = u.get("last_start_time")
-        if last_start:
-            elapsed += now - last_start
+        if u.get("last_start_time"):
+            elapsed += now - u["last_start_time"]
         remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
 
         collection.update_one({"hwid": hwid}, {"$set": {"last_seen": now}})
@@ -237,15 +214,33 @@ def unban(data: HWIDModel):
 @app.post("/heartbeat")
 def heartbeat(data: HeartbeatModel):
     now = int(time.time())
-    update_trial_elapsed(data.hwid)  # รวมเวลา session ถ้า offline เกิน threshold
-    collection.update_one(
-        {"hwid": data.hwid},
-        {"$set": {"last_seen": now, "last_heartbeat": now}},
-        upsert=True
-    )
+    u = collection.find_one({"hwid": data.hwid})
+    if u:
+        # Update last_seen
+        collection.update_one(
+            {"hwid": data.hwid},
+            {"$set": {"last_seen": now, "last_heartbeat": now}}
+        )
+
+        # สำหรับ licensed users: เพิ่มเวลา total_usage_sec
+        if u.get("user_type") == "licensed" and u.get("last_start_time"):
+            elapsed = now - u["last_start_time"]
+            total_usage = u.get("total_usage_sec", 0) + elapsed
+            collection.update_one(
+                {"hwid": data.hwid},
+                {"$set": {"total_usage_sec": total_usage, "last_start_time": now}}
+            )
+    else:
+        # ถ้าไม่มี user, upsert ไว้แค่ heartbeat
+        collection.update_one(
+            {"hwid": data.hwid},
+            {"$set": {"last_seen": now, "last_heartbeat": now}},
+            upsert=True
+        )
+
     return {"status": "success", "last_seen": now}
 
-# ======================= TRIAL SESSION START/STOP =======================
+# ======================= START/STOP SESSION =======================
 @app.post("/start_trial_session")
 def start_trial_session(data: HWIDModel):
     now = int(time.time())
@@ -262,6 +257,33 @@ def stop_trial_session(data: HWIDModel):
     u = collection.find_one({"hwid": data.hwid})
     if not u or not u.get("trial"):
         raise HTTPException(status_code=404, detail="Trial ไม่พบ")
+    
+    last_start = u.get("last_start_time")
+    if last_start:
+        elapsed = now - last_start
+        total_usage = u.get("total_usage_sec", 0) + elapsed
+        collection.update_one(
+            {"hwid": data.hwid},
+            {"$set": {"total_usage_sec": total_usage, "last_start_time": None}}
+        )
+    return {"status": "stopped"}
+
+@app.post("/start_session")
+def start_session(data: HWIDModel):
+    now = int(time.time())
+    u = collection.find_one({"hwid": data.hwid})
+    if not u:
+        raise HTTPException(status_code=404, detail="User ไม่พบ")
+
+    collection.update_one({"hwid": data.hwid}, {"$set": {"last_start_time": now}})
+    return {"status": "started"}
+
+@app.post("/stop_session")
+def stop_session(data: HWIDModel):
+    now = int(time.time())
+    u = collection.find_one({"hwid": data.hwid})
+    if not u:
+        raise HTTPException(status_code=404, detail="User ไม่พบ")
     
     last_start = u.get("last_start_time")
     if last_start:
