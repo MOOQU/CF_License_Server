@@ -62,6 +62,23 @@ def get_next_trial_id():
     meta.update_one({"_id": "trial_counter"}, {"$set": {"value": new_val}})
     return new_val
 
+def update_trial_elapsed(hwid):
+    """รวมเวลา session ถ้ามี last_start_time และ offline เกิน ONLINE_THRESHOLD"""
+    now = int(time.time())
+    u = collection.find_one({"hwid": hwid})
+    if not u or not u.get("trial"):
+        return
+    last_start = u.get("last_start_time")
+    last_seen = u.get("last_seen", now)
+    if last_start and now - last_seen > ONLINE_THRESHOLD:
+        # session หยุดโดย client offline
+        elapsed = now - last_start
+        total = u.get("total_usage_sec", 0) + elapsed
+        collection.update_one(
+            {"hwid": hwid},
+            {"$set": {"total_usage_sec": total, "last_start_time": None}}
+        )
+
 # -------------------------
 # API
 # -------------------------
@@ -84,8 +101,9 @@ def userslist():
         if u.get("trial", False):
             # รวมเวลาที่ใช้งานจริง + กำลังรันอยู่ตอนนี้
             elapsed = u.get("total_usage_sec", 0)
-            if u.get("last_start_time"):
-                elapsed += now - u["last_start_time"]
+            last_start = u.get("last_start_time")
+            if last_start:
+                elapsed += now - last_start
             u["trial_remaining_minutes"] = max(0, (TRIAL_LIMIT_SEC - elapsed) // 60)
         else:
             u["trial_remaining_minutes"] = "-"
@@ -154,6 +172,9 @@ def request_trial(data: TrialRequestModel):
 
     u = collection.find_one({"hwid": hwid})
     
+    # รวมเวลาที่ใช้จริงถ้า session เก่า
+    update_trial_elapsed(hwid)
+
     # สร้าง trial ใหม่
     if not u:
         tid = get_next_trial_id()
@@ -183,8 +204,9 @@ def request_trial(data: TrialRequestModel):
     # ยังอยู่ใน trial
     if u.get("trial"):
         elapsed = u.get("total_usage_sec", 0)
-        if u.get("last_start_time"):
-            elapsed += now - u["last_start_time"]
+        last_start = u.get("last_start_time")
+        if last_start:
+            elapsed += now - last_start
         remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
 
         collection.update_one({"hwid": hwid}, {"$set": {"last_seen": now}})
@@ -215,6 +237,7 @@ def unban(data: HWIDModel):
 @app.post("/heartbeat")
 def heartbeat(data: HeartbeatModel):
     now = int(time.time())
+    update_trial_elapsed(data.hwid)  # รวมเวลา session ถ้า offline เกิน threshold
     collection.update_one(
         {"hwid": data.hwid},
         {"$set": {"last_seen": now, "last_heartbeat": now}},
