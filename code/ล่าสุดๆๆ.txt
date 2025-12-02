@@ -9,7 +9,7 @@ app = FastAPI(title="CF AutoText License Server")
 # -------------------------
 # MongoDB Setup
 # -------------------------
-MONGO_URI = "mongodb+srv://MOOQU:SIRIMEEMAK@cluster0.crufku8.mongodb.net/cf_license_db?retryWrites=true&w=majority"
+MONGO_URI = mongodb+srvMOOQUSIRIMEEMAK@cluster0.crufku8.mongodb.netcf_license_dbretryWrites=true&w=majority
 DB_NAME = "cf_license_db"
 
 client = MongoClient(MONGO_URI)
