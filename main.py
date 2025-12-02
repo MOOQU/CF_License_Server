@@ -15,6 +15,7 @@ DB_NAME = "cf_license_db"
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 collection = db["licenses"]
+meta = db["meta"]
 
 # -------------------------
 # Models
@@ -31,79 +32,95 @@ class UsernameModel(BaseModel):
 class HWIDModel(BaseModel):
     hwid: str
 
-class ReportStatusModel(BaseModel):
-    username: str = None
+class TrialRequestModel(BaseModel):
     hwid: str
-    mode: str
-    remaining: int = None
     version: str
 
 class HeartbeatModel(BaseModel):
     hwid: str
     username: str = None
-    mode: str = None  # "trial" หรือ "licensed"
+    mode: str = None
 
 # -------------------------
-# License Helper
+# Settings
+# -------------------------
+TRIAL_LIMIT_SEC = 7200  # 2 ชั่วโมง
+ONLINE_THRESHOLD = 120  # 2 นาที
+
+# -------------------------
+# Helpers
 # -------------------------
 def gen_license_key():
     return uuid.uuid4().hex[:16].upper()
 
-TRIAL_LIMIT_SEC = 2 * 60 * 60  # 2 ชั่วโมง
-ONLINE_THRESHOLD = 120  # วินาที สำหรับ online/offline
+def get_next_trial_id():
+    counter = meta.find_one({"_id": "trial_counter"})
+    if not counter:
+        meta.insert_one({"_id": "trial_counter", "value": 1})
+        return 1
+    new_val = counter["value"] + 1
+    meta.update_one({"_id": "trial_counter"}, {"$set": {"value": new_val}})
+    return new_val
 
 # -------------------------
-# API Endpoints
+# API
 # -------------------------
 @app.get("/")
 def root():
     return {"message": "Server is running!"}
 
-# ===== USERS LIST =====
+# ======================= USERS LIST =======================
 @app.get("/userslist")
-def list_users():
-    try:
-        users = list(collection.find({}, {"_id": 0}))
-        # เพิ่ม field online/offline
-        now = int(time.time())
-        for u in users:
-            last_seen = u.get("last_seen", 0)
-            u["online"] = (now - last_seen <= ONLINE_THRESHOLD)
-        return {"users": users}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def userslist():
+    users = list(collection.find({}, {"_id": 0}))
+    now = int(time.time())
 
-# ===== GENERATE LICENSE =====
+    for u in users:
+        last_seen = u.get("last_seen", 0)
+        u["online"] = (now - last_seen <= ONLINE_THRESHOLD)
+
+        if u.get("trial", False):
+            elapsed = now - u.get("trial_start", now)
+            u["trial_remaining_minutes"] = max(0, (TRIAL_LIMIT_SEC - elapsed) // 60)
+        else:
+            u["trial_remaining_minutes"] = "-"
+
+    return {"users": users}
+
+# ======================= GEN LICENSE =======================
 @app.post("/usersgen_license")
 def gen_license(user: UsernameModel):
     if collection.find_one({"username": user.username}):
         raise HTTPException(status_code=400, detail="User มีอยู่แล้ว")
+
     license_key = gen_license_key()
     now = int(time.time())
+
     collection.insert_one({
         "username": user.username,
         "license": license_key,
-        "status": "active",
         "hwid": "",
         "banned": False,
         "trial": False,
         "trial_start": None,
+        "status": "active",
         "total_usage_sec": 0,
-        "last_heartbeat": now,
         "last_seen": now,
+        "last_heartbeat": now,
         "user_type": "licensed"
     })
+
     return {"status": "success", "username": user.username, "license": license_key}
 
-# ===== DELETE USER =====
+# ======================= DELETE USER =======================
 @app.post("/usersdelete")
 def delete_user(user: UsernameModel):
     result = collection.delete_one({"username": user.username})
     if result.deleted_count == 0:
         raise HTTPException(status_code=400, detail="User ไม่พบ")
-    return {"status": "success", "message": f"User {user.username} ลบแล้ว"}
+    return {"status": "success"}
 
-# ===== CHECK LICENSE =====
+# ======================= CHECK LICENSE =======================
 @app.post("/check_license")
 def check_license(req: LicenseCheck):
     u = collection.find_one({"username": req.username, "license": req.license})
@@ -111,137 +128,87 @@ def check_license(req: LicenseCheck):
         return {"status": "invalid", "message": "License ไม่ถูกต้อง"}
 
     if u.get("banned"):
-        return {"status": "invalid", "message": "License ถูกบล็อค (Banned)"}
+        return {"status": "invalid", "message": "บัญชีถูกแบน"}
 
-    # HWID binding
     if not u.get("hwid"):
         collection.update_one({"username": req.username}, {"$set": {"hwid": req.hwid}})
-    elif u.get("hwid") != req.hwid:
+    elif u["hwid"] != req.hwid:
         return {"status": "invalid", "message": "HWID ไม่ตรง"}
 
     now = int(time.time())
-    # คำนวณ trial
-    if u.get("trial", False):
-        elapsed = now - u.get("trial_start", now)
-        if elapsed > TRIAL_LIMIT_SEC:
-            collection.update_one({"username": req.username}, {"$set": {"trial": False}})
-            return {"status": "invalid", "message": "หมดเวลาทดลองใช้"}
-        # อัปเดต total_usage
-        last = u.get("last_heartbeat", now)
-        total = u.get("total_usage_sec", 0) + (now - last)
-        collection.update_one({"username": req.username},
-                              {"$set": {"total_usage_sec": total, "last_heartbeat": now, "last_seen": now}})
-    else:
-        collection.update_one({"username": req.username}, {"$set": {"last_seen": now}})
+    collection.update_one({"username": req.username}, {"$set": {"last_seen": now}})
 
-    return {"status": "valid", "message": "License ถูกต้อง"}
+    return {"status": "valid"}
 
-# ===== BAN / UNBAN =====
+# ======================= REQUEST TRIAL (100% server) =======================
+@app.post("/request_trial")
+def request_trial(data: TrialRequestModel):
+    hwid = data.hwid
+    now = int(time.time())
+
+    u = collection.find_one({"hwid": hwid})
+    
+    # สร้าง trial ใหม่
+    if not u:
+        tid = get_next_trial_id()
+        username = f"TRIAL USER {tid}"
+
+        collection.insert_one({
+            "username": username,
+            "license": "",
+            "hwid": hwid,
+            "trial": True,
+            "trial_start": now,
+            "total_usage_sec": 0,
+            "status": "active",
+            "banned": False,
+            "last_seen": now,
+            "last_heartbeat": now,
+            "user_type": "trial"
+        })
+
+        return {"status": "active", "username": username, "remaining": TRIAL_LIMIT_SEC}
+
+    # ถูกแบน
+    if u.get("banned"):
+        return {"status": "banned", "remaining": 0}
+
+    # ยังอยู่ใน trial
+    if u.get("trial"):
+        elapsed = now - u["trial_start"]
+        remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
+        collection.update_one({"hwid": hwid}, {"$set": {"last_seen": now}})
+
+        if remaining <= 0:
+            return {"status": "expired", "remaining": 0}
+
+        return {"status": "active", "username": u["username"], "remaining": remaining}
+
+    # หมด trial แล้ว
+    return {"status": "expired", "remaining": 0}
+
+# ======================= BAN/UNBAN =======================
 @app.post("/ban")
-def ban_device(data: HWIDModel):
+def ban(data: HWIDModel):
     result = collection.update_one({"hwid": data.hwid}, {"$set": {"banned": True}})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="HWID ไม่พบ")
-    return {"status": "success", "message": f"{data.hwid} ถูกบล็อคเรียบร้อย"}
+    return {"status": "success"}
 
 @app.post("/unban")
-def unban_device(data: HWIDModel):
+def unban(data: HWIDModel):
     result = collection.update_one({"hwid": data.hwid}, {"$set": {"banned": False}})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="HWID ไม่พบ")
-    return {"status": "success", "message": f"{data.hwid} ถูกปลดบล็อคเรียบร้อย"}
-
-@app.post("/check_ban")
-def check_ban(data: HWIDModel):
-    u = collection.find_one({"hwid": data.hwid})
-    if not u:
-        raise HTTPException(status_code=404, detail="HWID ไม่พบ")
-    return {"hwid": data.hwid, "banned": u.get("banned", False)}
-
-# ===== REPORT STATUS TO ADMIN =====
-@app.post("/report_status")
-def report_status(data: ReportStatusModel):
-    now = int(time.time())
-    query = {"hwid": data.hwid}
-    existing = collection.find_one(query)
-
-    # สร้างชื่อ Trial User อัตโนมัติ
-    if not existing and data.mode == "trial":
-        trial_users = collection.find({"user_type": "trial"}, {"username": 1})
-        max_num = 0
-        for u in trial_users:
-            uname = u.get("username", "")
-            if uname.startswith("TRIAL USER (เครื่องที่ "):
-                try:
-                    num = int(uname.replace("TRIAL USER (เครื่องที่ ", "").replace(")", ""))
-                    if num > max_num:
-                        max_num = num
-                except:
-                    continue
-        username = f"TRIAL USER (เครื่องที่ {max_num + 1})"
-    else:
-        username = data.username or (existing.get("username") if existing else None)
-
-    update = {
-        "$set": {
-            "last_seen": now,
-            "mode": data.mode,
-            "version": data.version,
-            "username": username,
-            "user_type": "trial" if data.mode == "trial" else "licensed"
-        }
-    }
-
-    # คำนวณเวลาคงเหลือสำหรับ Trial
-    if data.mode == "trial":
-        trial_start = existing.get("trial_start") if existing else now
-        elapsed = now - trial_start
-        remaining_sec = max(0, TRIAL_LIMIT_SEC - elapsed)
-        remaining_min = remaining_sec // 60
-
-        update["$set"]["trial_start"] = trial_start
-        update["$set"]["trial_remaining_sec"] = remaining_sec
-        update["$set"]["trial_remaining_minutes"] = remaining_min
-        update["$set"]["trial"] = True
-    else:
-        update["$set"]["trial"] = False
-
-    update.setdefault("$setOnInsert", {
-        "license": "",
-        "status": "active",
-        "banned": False,
-        "hwid": data.hwid,
-        "total_usage_sec": 0,
-        "last_heartbeat": now
-    })
-
-    collection.update_one(query, update, upsert=True)
     return {"status": "success"}
 
-# ===== HEARTBEAT =====
+# ======================= HEARTBEAT =======================
 @app.post("/heartbeat")
 def heartbeat(data: HeartbeatModel):
     now = int(time.time())
-    query = {"hwid": data.hwid}
-    
-    update = {
-        "$set": {
-            "last_seen": now,
-            "username": data.username,
-            "mode": data.mode
-        }
-    }
-    
-    # สร้างใหม่ถ้า HWID ไม่เคยมี
-    update.setdefault("$setOnInsert", {
-        "license": "",
-        "status": "active",
-        "banned": False,
-        "hwid": data.hwid,
-        "total_usage_sec": 0,
-        "last_heartbeat": now,
-        "user_type": "trial" if data.mode=="trial" else "licensed"
-    })
-    
-    collection.update_one(query, update, upsert=True)
+    collection.update_one(
+        {"hwid": data.hwid},
+        {"$set": {"last_seen": now, "last_heartbeat": now}},
+        upsert=True
+    )
     return {"status": "success", "last_seen": now}

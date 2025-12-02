@@ -9,7 +9,7 @@ app = FastAPI(title="CF AutoText License Server")
 # -------------------------
 # MongoDB Setup
 # -------------------------
-MONGO_URI = mongodb+srvMOOQUSIRIMEEMAK@cluster0.crufku8.mongodb.netcf_license_dbretryWrites=true&w=majority
+MONGO_URI = "mongodb+srv://MOOQUSIRIMEEMAK@cluster0.crufku8.mongodb.net/cf_license_db?retryWrites=true&w=majority"
 DB_NAME = "cf_license_db"
 
 client = MongoClient(MONGO_URI)
@@ -43,6 +43,10 @@ class HeartbeatModel(BaseModel):
     username: str = None
     mode: str = None  # "trial" หรือ "licensed"
 
+class TrialCheckModel(BaseModel):
+    hwid: str
+    version: str
+
 # -------------------------
 # License Helper
 # -------------------------
@@ -64,7 +68,6 @@ def root():
 def list_users():
     try:
         users = list(collection.find({}, {"_id": 0}))
-        # เพิ่ม field online/offline
         now = int(time.time())
         for u in users:
             last_seen = u.get("last_seen", 0)
@@ -113,20 +116,17 @@ def check_license(req: LicenseCheck):
     if u.get("banned"):
         return {"status": "invalid", "message": "License ถูกบล็อค (Banned)"}
 
-    # HWID binding
     if not u.get("hwid"):
         collection.update_one({"username": req.username}, {"$set": {"hwid": req.hwid}})
     elif u.get("hwid") != req.hwid:
         return {"status": "invalid", "message": "HWID ไม่ตรง"}
 
     now = int(time.time())
-    # คำนวณ trial
     if u.get("trial", False):
         elapsed = now - u.get("trial_start", now)
         if elapsed > TRIAL_LIMIT_SEC:
             collection.update_one({"username": req.username}, {"$set": {"trial": False}})
             return {"status": "invalid", "message": "หมดเวลาทดลองใช้"}
-        # อัปเดต total_usage
         last = u.get("last_heartbeat", now)
         total = u.get("total_usage_sec", 0) + (now - last)
         collection.update_one({"username": req.username},
@@ -135,6 +135,51 @@ def check_license(req: LicenseCheck):
         collection.update_one({"username": req.username}, {"$set": {"last_seen": now}})
 
     return {"status": "valid", "message": "License ถูกต้อง"}
+
+# ===== CHECK TRIAL =====
+@app.post("/check_trial")
+def check_trial(data: TrialCheckModel):
+    hwid = data.hwid
+    now = int(time.time())
+    u = collection.find_one({"hwid": hwid})
+
+    if not u:
+        # ถ้าไม่มี ให้สร้าง trial ใหม่
+        username = f"TRIAL USER ({hwid[:6]})"
+        collection.insert_one({
+            "username": username,
+            "license": "",
+            "hwid": hwid,
+            "trial": True,
+            "trial_start": now,
+            "total_usage_sec": 0,
+            "last_heartbeat": now,
+            "last_seen": now,
+            "user_type": "trial",
+            "banned": False,
+            "status": "active"
+        })
+        remaining = TRIAL_LIMIT_SEC
+        return {"status": "active", "remaining": remaining}
+
+    if u.get("banned"):
+        return {"status": "banned", "remaining": 0}
+
+    if u.get("trial", False):
+        trial_start = u.get("trial_start", now)
+        elapsed = now - trial_start
+        remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
+        if remaining <= 0:
+            collection.update_one({"hwid": hwid}, {"$set": {"trial": False}})
+            return {"status": "expired", "remaining": 0}
+        # update heartbeat
+        last = u.get("last_heartbeat", now)
+        total = u.get("total_usage_sec", 0) + (now - last)
+        collection.update_one({"hwid": hwid},
+                              {"$set": {"total_usage_sec": total, "last_heartbeat": now, "last_seen": now}})
+        return {"status": "active", "remaining": remaining}
+    else:
+        return {"status": "expired", "remaining": 0}
 
 # ===== BAN / UNBAN =====
 @app.post("/ban")
@@ -158,27 +203,15 @@ def check_ban(data: HWIDModel):
         raise HTTPException(status_code=404, detail="HWID ไม่พบ")
     return {"hwid": data.hwid, "banned": u.get("banned", False)}
 
-# ===== REPORT STATUS TO ADMIN =====
+# ===== REPORT STATUS =====
 @app.post("/report_status")
 def report_status(data: ReportStatusModel):
     now = int(time.time())
     query = {"hwid": data.hwid}
     existing = collection.find_one(query)
 
-    # สร้างชื่อ Trial User อัตโนมัติ
     if not existing and data.mode == "trial":
-        trial_users = collection.find({"user_type": "trial"}, {"username": 1})
-        max_num = 0
-        for u in trial_users:
-            uname = u.get("username", "")
-            if uname.startswith("TRIAL USER (เครื่องที่ "):
-                try:
-                    num = int(uname.replace("TRIAL USER (เครื่องที่ ", "").replace(")", ""))
-                    if num > max_num:
-                        max_num = num
-                except:
-                    continue
-        username = f"TRIAL USER (เครื่องที่ {max_num + 1})"
+        username = f"TRIAL USER ({hwid[:6]})"
     else:
         username = data.username or (existing.get("username") if existing else None)
 
@@ -192,7 +225,6 @@ def report_status(data: ReportStatusModel):
         }
     }
 
-    # คำนวณเวลาคงเหลือสำหรับ Trial
     if data.mode == "trial":
         trial_start = existing.get("trial_start") if existing else now
         elapsed = now - trial_start
@@ -223,7 +255,7 @@ def report_status(data: ReportStatusModel):
 def heartbeat(data: HeartbeatModel):
     now = int(time.time())
     query = {"hwid": data.hwid}
-    
+
     update = {
         "$set": {
             "last_seen": now,
@@ -231,8 +263,7 @@ def heartbeat(data: HeartbeatModel):
             "mode": data.mode
         }
     }
-    
-    # สร้างใหม่ถ้า HWID ไม่เคยมี
+
     update.setdefault("$setOnInsert", {
         "license": "",
         "status": "active",
@@ -242,6 +273,6 @@ def heartbeat(data: HeartbeatModel):
         "last_heartbeat": now,
         "user_type": "trial" if data.mode=="trial" else "licensed"
     })
-    
+
     collection.update_one(query, update, upsert=True)
     return {"status": "success", "last_seen": now}
