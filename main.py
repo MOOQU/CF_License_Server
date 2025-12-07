@@ -1,4 +1,4 @@
-# CF AutoText License Server (FULL FIXED VERSION)
+# CF AutoText License Server (FULL FIXED VERSION + REMOVE TRIAL WHEN LICENSE ACTIVATES)
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
@@ -83,7 +83,6 @@ def userslist():
         last_seen = u.get("last_seen", 0)
         u["online"] = (now - last_seen <= ONLINE_THRESHOLD)
 
-        # trial remaining
         if u.get("trial"):
             elapsed = u.get("total_usage_sec", 0)
             if u.get("last_start_time"):
@@ -132,7 +131,7 @@ def delete_user(user: UsernameModel):
     return {"status": "success"}
 
 # ============================================================
-# CHECK LICENSE (Normal Login)
+# CHECK LICENSE (NOW REMOVES TRIAL)
 # ============================================================
 @app.post("/check_license")
 def check_license(req: LicenseCheck):
@@ -143,6 +142,11 @@ def check_license(req: LicenseCheck):
     if u.get("banned"):
         return {"status": "invalid", "message": "บัญชีถูกแบน"}
 
+    # ----- (NEW) REMOVE TRIAL IF SAME HWID -----
+    trial_user = collection.find_one({"hwid": req.hwid, "trial": True})
+    if trial_user:
+        collection.delete_one({"hwid": req.hwid})
+
     # bind HWID first time
     if not u.get("hwid"):
         collection.update_one(
@@ -152,7 +156,7 @@ def check_license(req: LicenseCheck):
     elif u["hwid"] != req.hwid:
         return {"status": "invalid", "message": "HWID ไม่ตรง"}
 
-    # update online
+    # online update
     now = int(time.time())
     collection.update_one(
         {"username": req.username},
@@ -170,7 +174,6 @@ def request_trial(data: TrialRequestModel):
     now = int(time.time())
     u = collection.find_one({"hwid": hwid})
 
-    # new trial
     if not u:
         tid = get_next_trial_id()
         username = f"TRIAL USER {tid}"
@@ -191,11 +194,9 @@ def request_trial(data: TrialRequestModel):
         })
         return {"status": "active", "username": username, "remaining": TRIAL_LIMIT_SEC}
 
-    # banned
     if u.get("banned"):
         return {"status": "banned", "remaining": 0}
 
-    # still in trial
     if u.get("trial"):
         elapsed = u.get("total_usage_sec", 0)
         if u.get("last_start_time"):
@@ -232,7 +233,6 @@ def check_trial(data: HWIDModel):
 
     remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
 
-    # online update
     collection.update_one(
         {"hwid": data.hwid},
         {"$set": {"last_seen": now, "last_heartbeat": now}}
@@ -261,7 +261,7 @@ def unban(data: HWIDModel):
     return {"status": "success"}
 
 # ============================================================
-# HEARTBEAT (FIXED)
+# HEARTBEAT
 # ============================================================
 @app.post("/heartbeat")
 def heartbeat(data: HeartbeatModel):
@@ -271,13 +271,11 @@ def heartbeat(data: HeartbeatModel):
     if not u:
         return {"status": "fail", "reason": "user_not_found"}
 
-    # update online
     collection.update_one(
         {"hwid": data.hwid},
         {"$set": {"last_seen": now, "last_heartbeat": now}}
     )
 
-    # time usage count
     last_start = u.get("last_start_time")
     if last_start:
         elapsed = now - last_start
@@ -291,7 +289,6 @@ def heartbeat(data: HeartbeatModel):
             }}
         )
 
-    # trial logic
     if u.get("trial"):
         used = u.get("total_usage_sec", 0)
         remaining = max(0, TRIAL_LIMIT_SEC - used)
@@ -299,11 +296,10 @@ def heartbeat(data: HeartbeatModel):
             return {"status": "expired", "remaining": 0}
         return {"status": "active", "remaining": remaining}
 
-    # licensed OK
     return {"status": "ok", "user_type": "licensed"}
 
 # ============================================================
-# START/STOP Trial Session
+# START/STOP SESSIONS
 # ============================================================
 @app.post("/start_trial_session")
 def start_trial_session(data: HWIDModel):
@@ -333,9 +329,6 @@ def stop_trial_session(data: HWIDModel):
         )
     return {"status": "stopped"}
 
-# ============================================================
-# START/STOP Licensed Session
-# ============================================================
 @app.post("/start_session")
 def start_session(data: HWIDModel):
     now = int(time.time())
