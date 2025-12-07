@@ -1,4 +1,4 @@
-# CF AutoText License Server
+# CF AutoText License Server (FULL FIXED VERSION)
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
@@ -39,14 +39,14 @@ class TrialRequestModel(BaseModel):
 
 class HeartbeatModel(BaseModel):
     hwid: str
-    username: str = None
-    mode: str = None
+    username: str | None = None
+    mode: str | None = None   # "trial" / "licensed"
 
 # -------------------------
 # Settings
 # -------------------------
-TRIAL_LIMIT_SEC = 7200  # 2 hours
-ONLINE_THRESHOLD = 100  # 100 seconds
+TRIAL_LIMIT_SEC = 7200          # 2 hours
+ONLINE_THRESHOLD = 160          # admin GUI uses 160 sec
 
 # -------------------------
 # Helpers
@@ -60,12 +60,8 @@ def get_next_trial_id():
     if not counter:
         meta.insert_one({"_id": "trial_counter", "value": 1})
         return 1
-
     new_val = counter["value"] + 1
-    meta.update_one(
-        {"_id": "trial_counter"},
-        {"$set": {"value": new_val}}
-    )
+    meta.update_one({"_id": "trial_counter"}, {"$set": {"value": new_val}})
     return new_val
 
 # ============================================================
@@ -123,7 +119,6 @@ def gen_license(user: UsernameModel):
         "last_heartbeat": now,
         "user_type": "licensed"
     })
-
     return {"status": "success", "username": user.username, "license": license_key}
 
 # ============================================================
@@ -148,21 +143,20 @@ def check_license(req: LicenseCheck):
     if u.get("banned"):
         return {"status": "invalid", "message": "บัญชีถูกแบน"}
 
-    # first binding HWID
+    # bind HWID first time
     if not u.get("hwid"):
         collection.update_one(
             {"username": req.username},
             {"$set": {"hwid": req.hwid}}
         )
-
-    # wrong hwid
     elif u["hwid"] != req.hwid:
         return {"status": "invalid", "message": "HWID ไม่ตรง"}
 
+    # update online
     now = int(time.time())
     collection.update_one(
         {"username": req.username},
-        {"$set": {"last_seen": now}}
+        {"$set": {"last_seen": now, "last_heartbeat": now}}
     )
 
     return {"status": "valid"}
@@ -174,10 +168,9 @@ def check_license(req: LicenseCheck):
 def request_trial(data: TrialRequestModel):
     hwid = data.hwid
     now = int(time.time())
-
     u = collection.find_one({"hwid": hwid})
 
-    # create new trial
+    # new trial
     if not u:
         tid = get_next_trial_id()
         username = f"TRIAL USER {tid}"
@@ -196,7 +189,6 @@ def request_trial(data: TrialRequestModel):
             "last_heartbeat": now,
             "user_type": "trial"
         })
-
         return {"status": "active", "username": username, "remaining": TRIAL_LIMIT_SEC}
 
     # banned
@@ -210,11 +202,7 @@ def request_trial(data: TrialRequestModel):
             elapsed += now - u["last_start_time"]
 
         remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
-
-        collection.update_one(
-            {"hwid": hwid},
-            {"$set": {"last_seen": now}}
-        )
+        collection.update_one({"hwid": hwid}, {"$set": {"last_seen": now}})
 
         if remaining <= 0:
             return {"status": "expired", "remaining": 0}
@@ -233,10 +221,8 @@ def check_trial(data: HWIDModel):
 
     if not u:
         return {"status": "no_user"}
-
     if u.get("banned"):
         return {"status": "banned", "remaining": 0}
-
     if not u.get("trial"):
         return {"status": "licensed", "remaining": None}
 
@@ -246,51 +232,42 @@ def check_trial(data: HWIDModel):
 
     remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
 
+    # online update
     collection.update_one(
         {"hwid": data.hwid},
-        {"$set": {"last_seen": now}}
+        {"$set": {"last_seen": now, "last_heartbeat": now}}
     )
 
     if remaining <= 0:
         return {"status": "expired", "remaining": 0}
 
-    return {
-        "status": "active",
-        "remaining": remaining,
-        "username": u.get("username")
-    }
+    return {"status": "active", "remaining": remaining, "username": u["username"]}
 
 # ============================================================
 # BAN / UNBAN
 # ============================================================
 @app.post("/ban")
 def ban(data: HWIDModel):
-    result = collection.update_one(
-        {"hwid": data.hwid},
-        {"$set": {"banned": True}}
-    )
-    if result.matched_count == 0:
+    r = collection.update_one({"hwid": data.hwid}, {"$set": {"banned": True}})
+    if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="HWID ไม่พบ")
     return {"status": "success"}
 
 @app.post("/unban")
 def unban(data: HWIDModel):
-    result = collection.update_one(
-        {"hwid": data.hwid},
-        {"$set": {"banned": False}}
-    )
-    if result.matched_count == 0:
+    r = collection.update_one({"hwid": data.hwid}, {"$set": {"banned": False}})
+    if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="HWID ไม่พบ")
     return {"status": "success"}
 
 # ============================================================
-# HEARTBEAT  (ลดเวลา trial & licensed)
+# HEARTBEAT (FIXED)
 # ============================================================
 @app.post("/heartbeat")
 def heartbeat(data: HeartbeatModel):
     now = int(time.time())
-    u = collection.find_one({"hwid": data.hwid})
 
+    u = collection.find_one({"hwid": data.hwid})
     if not u:
         return {"status": "fail", "reason": "user_not_found"}
 
@@ -300,7 +277,7 @@ def heartbeat(data: HeartbeatModel):
         {"$set": {"last_seen": now, "last_heartbeat": now}}
     )
 
-    # time usage
+    # time usage count
     last_start = u.get("last_start_time")
     if last_start:
         elapsed = now - last_start
@@ -314,16 +291,15 @@ def heartbeat(data: HeartbeatModel):
             }}
         )
 
-    # Trial expire check
+    # trial logic
     if u.get("trial"):
         used = u.get("total_usage_sec", 0)
         remaining = max(0, TRIAL_LIMIT_SEC - used)
-
         if remaining <= 0:
             return {"status": "expired", "remaining": 0}
-
         return {"status": "active", "remaining": remaining}
 
+    # licensed OK
     return {"status": "ok", "user_type": "licensed"}
 
 # ============================================================
@@ -333,21 +309,16 @@ def heartbeat(data: HeartbeatModel):
 def start_trial_session(data: HWIDModel):
     now = int(time.time())
     u = collection.find_one({"hwid": data.hwid})
-
     if not u or not u.get("trial"):
         raise HTTPException(status_code=404, detail="Trial ไม่พบ")
 
-    collection.update_one(
-        {"hwid": data.hwid},
-        {"$set": {"last_start_time": now}}
-    )
+    collection.update_one({"hwid": data.hwid}, {"$set": {"last_start_time": now}})
     return {"status": "started"}
 
 @app.post("/stop_trial_session")
 def stop_trial_session(data: HWIDModel):
     now = int(time.time())
     u = collection.find_one({"hwid": data.hwid})
-
     if not u or not u.get("trial"):
         raise HTTPException(status_code=404, detail="Trial ไม่พบ")
 
@@ -360,7 +331,6 @@ def stop_trial_session(data: HWIDModel):
             {"hwid": data.hwid},
             {"$set": {"total_usage_sec": total_usage, "last_start_time": None}}
         )
-
     return {"status": "stopped"}
 
 # ============================================================
@@ -370,21 +340,16 @@ def stop_trial_session(data: HWIDModel):
 def start_session(data: HWIDModel):
     now = int(time.time())
     u = collection.find_one({"hwid": data.hwid})
-
     if not u:
         raise HTTPException(status_code=404, detail="User ไม่พบ")
 
-    collection.update_one(
-        {"hwid": data.hwid},
-        {"$set": {"last_start_time": now}}
-    )
+    collection.update_one({"hwid": data.hwid}, {"$set": {"last_start_time": now}})
     return {"status": "started"}
 
 @app.post("/stop_session")
 def stop_session(data: HWIDModel):
     now = int(time.time())
     u = collection.find_one({"hwid": data.hwid})
-
     if not u:
         raise HTTPException(status_code=404, detail="User ไม่พบ")
 
@@ -397,5 +362,4 @@ def stop_session(data: HWIDModel):
             {"hwid": data.hwid},
             {"$set": {"total_usage_sec": total_usage, "last_start_time": None}}
         )
-
     return {"status": "stopped"}
