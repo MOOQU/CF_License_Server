@@ -52,7 +52,8 @@ ONLINE_THRESHOLD = 100  # 100 seconds
 # Helpers
 # -------------------------
 def gen_license_key():
-    return uuid.uuid4().hex[:16].upper()
+    raw = uuid.uuid4().hex[:16].upper()
+    return f"{raw[0:4]}-{raw[4:8]}-{raw[8:12]}-{raw[12:16]}"
 
 def get_next_trial_id():
     counter = meta.find_one({"_id": "trial_counter"})
@@ -283,8 +284,7 @@ def unban(data: HWIDModel):
     return {"status": "success"}
 
 # ============================================================
-# HEARTBEAT (สำคัญที่สุด)
-# ลดเวลา trial + licensed ที่นี่
+# HEARTBEAT  (ลดเวลา trial & licensed)
 # ============================================================
 @app.post("/heartbeat")
 def heartbeat(data: HeartbeatModel):
