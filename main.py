@@ -45,8 +45,8 @@ class HeartbeatModel(BaseModel):
 # -------------------------
 # Settings
 # -------------------------
-TRIAL_LIMIT_SEC = 7200  # 2 ชั่วโมง
-ONLINE_THRESHOLD = 100  # 100 วินาที
+TRIAL_LIMIT_SEC = 7200  # 2 hours
+ONLINE_THRESHOLD = 100  # 100 seconds
 
 # -------------------------
 # Helpers
@@ -61,29 +61,33 @@ def get_next_trial_id():
         return 1
 
     new_val = counter["value"] + 1
-    meta.update_one({"_id": "trial_counter"}, {"$set": {"value": new_val}})
+    meta.update_one(
+        {"_id": "trial_counter"},
+        {"$set": {"value": new_val}}
+    )
     return new_val
 
-# -------------------------
-# API
-# -------------------------
+# ============================================================
+# ROOT
+# ============================================================
 @app.get("/")
 def root():
     return {"message": "Server is running!"}
 
-# ======================= USERS LIST =======================
+# ============================================================
+# USERS LIST (Admin)
+# ============================================================
 @app.get("/userslist")
 def userslist():
     users = list(collection.find({}, {"_id": 0}))
     now = int(time.time())
 
     for u in users:
-        # Online check
         last_seen = u.get("last_seen", 0)
         u["online"] = (now - last_seen <= ONLINE_THRESHOLD)
 
-        # Trial remaining time
-        if u.get("trial", False):
+        # trial remaining
+        if u.get("trial"):
             elapsed = u.get("total_usage_sec", 0)
             if u.get("last_start_time"):
                 elapsed += now - u["last_start_time"]
@@ -93,7 +97,9 @@ def userslist():
 
     return {"users": users}
 
-# ======================= GEN LICENSE =======================
+# ============================================================
+# GENERATE LICENSE
+# ============================================================
 @app.post("/usersgen_license")
 def gen_license(user: UsernameModel):
     if collection.find_one({"username": user.username}):
@@ -119,17 +125,19 @@ def gen_license(user: UsernameModel):
 
     return {"status": "success", "username": user.username, "license": license_key}
 
-# ======================= DELETE USER =======================
+# ============================================================
+# DELETE USER
+# ============================================================
 @app.post("/usersdelete")
 def delete_user(user: UsernameModel):
     result = collection.delete_one({"username": user.username})
-
     if result.deleted_count == 0:
         raise HTTPException(status_code=400, detail="User ไม่พบ")
-
     return {"status": "success"}
 
-# ======================= CHECK LICENSE =======================
+# ============================================================
+# CHECK LICENSE (Normal Login)
+# ============================================================
 @app.post("/check_license")
 def check_license(req: LicenseCheck):
     u = collection.find_one({"username": req.username, "license": req.license})
@@ -139,17 +147,28 @@ def check_license(req: LicenseCheck):
     if u.get("banned"):
         return {"status": "invalid", "message": "บัญชีถูกแบน"}
 
+    # first binding HWID
     if not u.get("hwid"):
-        collection.update_one({"username": req.username}, {"$set": {"hwid": req.hwid}})
+        collection.update_one(
+            {"username": req.username},
+            {"$set": {"hwid": req.hwid}}
+        )
+
+    # wrong hwid
     elif u["hwid"] != req.hwid:
         return {"status": "invalid", "message": "HWID ไม่ตรง"}
 
     now = int(time.time())
-    collection.update_one({"username": req.username}, {"$set": {"last_seen": now}})
+    collection.update_one(
+        {"username": req.username},
+        {"$set": {"last_seen": now}}
+    )
 
     return {"status": "valid"}
 
-# ======================= REQUEST TRIAL =======================
+# ============================================================
+# TRIAL REQUEST
+# ============================================================
 @app.post("/request_trial")
 def request_trial(data: TrialRequestModel):
     hwid = data.hwid
@@ -157,7 +176,7 @@ def request_trial(data: TrialRequestModel):
 
     u = collection.find_one({"hwid": hwid})
 
-    # สร้าง trial ใหม่
+    # create new trial
     if not u:
         tid = get_next_trial_id()
         username = f"TRIAL USER {tid}"
@@ -179,28 +198,33 @@ def request_trial(data: TrialRequestModel):
 
         return {"status": "active", "username": username, "remaining": TRIAL_LIMIT_SEC}
 
-    # ถูกแบน
+    # banned
     if u.get("banned"):
         return {"status": "banned", "remaining": 0}
 
-    # ยังอยู่ใน trial
+    # still in trial
     if u.get("trial"):
         elapsed = u.get("total_usage_sec", 0)
         if u.get("last_start_time"):
             elapsed += now - u["last_start_time"]
 
         remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
-        collection.update_one({"hwid": hwid}, {"$set": {"last_seen": now}})
+
+        collection.update_one(
+            {"hwid": hwid},
+            {"$set": {"last_seen": now}}
+        )
 
         if remaining <= 0:
             return {"status": "expired", "remaining": 0}
 
         return {"status": "active", "username": u["username"], "remaining": remaining}
 
-    # หมด trial แล้ว
     return {"status": "expired", "remaining": 0}
 
-# ======================= CHECK TRIAL =======================
+# ============================================================
+# CHECK TRIAL STATUS
+# ============================================================
 @app.post("/check_trial")
 def check_trial(data: HWIDModel):
     now = int(time.time())
@@ -209,22 +233,18 @@ def check_trial(data: HWIDModel):
     if not u:
         return {"status": "no_user"}
 
-    # ถูกแบน
     if u.get("banned"):
         return {"status": "banned", "remaining": 0}
 
-    # ไม่ใช่ trial
     if not u.get("trial"):
         return {"status": "licensed", "remaining": None}
 
-    # คำนวณเวลาที่เหลือ
     elapsed = u.get("total_usage_sec", 0)
     if u.get("last_start_time"):
         elapsed += now - u["last_start_time"]
 
     remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
 
-    # update last_seen
     collection.update_one(
         {"hwid": data.hwid},
         {"$set": {"last_seen": now}}
@@ -239,56 +259,76 @@ def check_trial(data: HWIDModel):
         "username": u.get("username")
     }
 
-# ======================= BAN / UNBAN =======================
+# ============================================================
+# BAN / UNBAN
+# ============================================================
 @app.post("/ban")
 def ban(data: HWIDModel):
-    result = collection.update_one({"hwid": data.hwid}, {"$set": {"banned": True}})
+    result = collection.update_one(
+        {"hwid": data.hwid},
+        {"$set": {"banned": True}}
+    )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="HWID ไม่พบ")
     return {"status": "success"}
 
 @app.post("/unban")
 def unban(data: HWIDModel):
-    result = collection.update_one({"hwid": data.hwid}, {"$set": {"banned": False}})
+    result = collection.update_one(
+        {"hwid": data.hwid},
+        {"$set": {"banned": False}}
+    )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="HWID ไม่พบ")
     return {"status": "success"}
 
-# ======================= HEARTBEAT =======================
+# ============================================================
+# HEARTBEAT (สำคัญที่สุด)
+# ลดเวลา trial + licensed ที่นี่
+# ============================================================
 @app.post("/heartbeat")
 def heartbeat(data: HeartbeatModel):
     now = int(time.time())
     u = collection.find_one({"hwid": data.hwid})
 
-    if u:
-        # Update last_seen
+    if not u:
+        return {"status": "fail", "reason": "user_not_found"}
+
+    # update online
+    collection.update_one(
+        {"hwid": data.hwid},
+        {"$set": {"last_seen": now, "last_heartbeat": now}}
+    )
+
+    # time usage
+    last_start = u.get("last_start_time")
+    if last_start:
+        elapsed = now - last_start
+        total_usage = u.get("total_usage_sec", 0) + elapsed
+
         collection.update_one(
             {"hwid": data.hwid},
-            {"$set": {"last_seen": now, "last_heartbeat": now}}
+            {"$set": {
+                "total_usage_sec": total_usage,
+                "last_start_time": now
+            }}
         )
 
-        # Licensed: update usage time
-        if u.get("user_type") == "licensed" and u.get("last_start_time"):
-            elapsed = now - u["last_start_time"]
-            total_usage = u.get("total_usage_sec", 0) + elapsed
+    # Trial expire check
+    if u.get("trial"):
+        used = u.get("total_usage_sec", 0)
+        remaining = max(0, TRIAL_LIMIT_SEC - used)
 
-            collection.update_one(
-                {"hwid": data.hwid},
-                {"$set": {
-                    "total_usage_sec": total_usage,
-                    "last_start_time": now
-                }}
-            )
-    else:
-        collection.update_one(
-            {"hwid": data.hwid},
-            {"$set": {"last_seen": now, "last_heartbeat": now}},
-            upsert=True
-        )
+        if remaining <= 0:
+            return {"status": "expired", "remaining": 0}
 
-    return {"status": "success", "last_seen": now}
+        return {"status": "active", "remaining": remaining}
 
-# ======================= TRIAL START/STOP =======================
+    return {"status": "ok", "user_type": "licensed"}
+
+# ============================================================
+# START/STOP Trial Session
+# ============================================================
 @app.post("/start_trial_session")
 def start_trial_session(data: HWIDModel):
     now = int(time.time())
@@ -297,7 +337,10 @@ def start_trial_session(data: HWIDModel):
     if not u or not u.get("trial"):
         raise HTTPException(status_code=404, detail="Trial ไม่พบ")
 
-    collection.update_one({"hwid": data.hwid}, {"$set": {"last_start_time": now}})
+    collection.update_one(
+        {"hwid": data.hwid},
+        {"$set": {"last_start_time": now}}
+    )
     return {"status": "started"}
 
 @app.post("/stop_trial_session")
@@ -320,7 +363,9 @@ def stop_trial_session(data: HWIDModel):
 
     return {"status": "stopped"}
 
-# ======================= NORMAL USER START/STOP =======================
+# ============================================================
+# START/STOP Licensed Session
+# ============================================================
 @app.post("/start_session")
 def start_session(data: HWIDModel):
     now = int(time.time())
@@ -329,7 +374,10 @@ def start_session(data: HWIDModel):
     if not u:
         raise HTTPException(status_code=404, detail="User ไม่พบ")
 
-    collection.update_one({"hwid": data.hwid}, {"$set": {"last_start_time": now}})
+    collection.update_one(
+        {"hwid": data.hwid},
+        {"$set": {"last_start_time": now}}
+    )
     return {"status": "started"}
 
 @app.post("/stop_session")
@@ -347,10 +395,7 @@ def stop_session(data: HWIDModel):
 
         collection.update_one(
             {"hwid": data.hwid},
-            {"$set": {
-                "total_usage_sec": total_usage,
-                "last_start_time": None
-            }}
+            {"$set": {"total_usage_sec": total_usage, "last_start_time": None}}
         )
 
     return {"status": "stopped"}
