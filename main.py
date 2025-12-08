@@ -1,4 +1,4 @@
-# CF AutoText License Server (FULL FIXED VERSION + REMOVE TRIAL WHEN LICENSE ACTIVATES)
+# CF AutoText License Server (SERVER FULL)
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
@@ -10,6 +10,7 @@ app = FastAPI(title="CF AutoText License Server")
 # -------------------------
 # MongoDB Setup
 # -------------------------
+# (ใช้ค่าเดิมที่คุณให้ไว้ — ระวัง credentials ถ้าจะแชร์ public)
 MONGO_URI = "mongodb+srv://MOOQU:SIRIMEEMAK@cluster0.crufku8.mongodb.net/cf_license_db?retryWrites=true&w=majority"
 DB_NAME = "cf_license_db"
 
@@ -131,7 +132,9 @@ def delete_user(user: UsernameModel):
     return {"status": "success"}
 
 # ============================================================
-# CHECK LICENSE (NOW REMOVES TRIAL)
+# CHECK LICENSE (NOW REMOVES TRIAL WHEN HWID MATCH)
+# - Binds HWID if empty
+# - Starts licensed session (sets last_start_time) so total_usage_sec will be tracked
 # ============================================================
 @app.post("/check_license")
 def check_license(req: LicenseCheck):
@@ -142,26 +145,28 @@ def check_license(req: LicenseCheck):
     if u.get("banned"):
         return {"status": "invalid", "message": "บัญชีถูกแบน"}
 
-    # ----- (NEW) REMOVE TRIAL IF SAME HWID -----
+    # ----- If there's a trial record with same HWID, remove it (convert-like behavior) -----
     trial_user = collection.find_one({"hwid": req.hwid, "trial": True})
     if trial_user:
+        # remove the trial record so it doesn't show up alongside the licensed record
         collection.delete_one({"hwid": req.hwid})
 
-    # bind HWID first time
+    # Bind HWID first time for licensed user
+    now = int(time.time())
     if not u.get("hwid"):
         collection.update_one(
             {"username": req.username},
-            {"$set": {"hwid": req.hwid}}
+            {"$set": {"hwid": req.hwid, "last_seen": now, "last_heartbeat": now, "last_start_time": now}}
         )
-    elif u["hwid"] != req.hwid:
-        return {"status": "invalid", "message": "HWID ไม่ตรง"}
-
-    # online update
-    now = int(time.time())
-    collection.update_one(
-        {"username": req.username},
-        {"$set": {"last_seen": now, "last_heartbeat": now}}
-    )
+    else:
+        # If HWID exists but different -> invalid
+        if u["hwid"] != req.hwid:
+            return {"status": "invalid", "message": "HWID ไม่ตรง"}
+        # update online + ensure last_start_time is set to start counting if missing
+        update_doc = {"last_seen": now, "last_heartbeat": now}
+        if not u.get("last_start_time"):
+            update_doc["last_start_time"] = now
+        collection.update_one({"username": req.username}, {"$set": update_doc})
 
     return {"status": "valid"}
 
@@ -233,6 +238,7 @@ def check_trial(data: HWIDModel):
 
     remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
 
+    # online update
     collection.update_one(
         {"hwid": data.hwid},
         {"$set": {"last_seen": now, "last_heartbeat": now}}
@@ -261,7 +267,9 @@ def unban(data: HWIDModel):
     return {"status": "success"}
 
 # ============================================================
-# HEARTBEAT
+# HEARTBEAT (FIXED: count time for both trial & licensed)
+# - Update last_seen/last_heartbeat
+# - If last_start_time exists, accumulate elapsed into total_usage_sec and reset last_start_time to now
 # ============================================================
 @app.post("/heartbeat")
 def heartbeat(data: HeartbeatModel):
@@ -271,15 +279,25 @@ def heartbeat(data: HeartbeatModel):
     if not u:
         return {"status": "fail", "reason": "user_not_found"}
 
+    # update online fields immediately
     collection.update_one(
         {"hwid": data.hwid},
         {"$set": {"last_seen": now, "last_heartbeat": now}}
     )
 
+    # fetch fresh record (to read last_start_time and total_usage_sec)
+    u = collection.find_one({"hwid": data.hwid})
+
     last_start = u.get("last_start_time")
     if last_start:
-        elapsed = now - last_start
-        total_usage = u.get("total_usage_sec", 0) + elapsed
+        try:
+            elapsed = now - int(last_start)
+            if elapsed < 0:
+                elapsed = 0
+        except Exception:
+            elapsed = 0
+
+        total_usage = int(u.get("total_usage_sec", 0) or 0) + elapsed
 
         collection.update_one(
             {"hwid": data.hwid},
@@ -289,17 +307,19 @@ def heartbeat(data: HeartbeatModel):
             }}
         )
 
+    # Trial-specific response
     if u.get("trial"):
-        used = u.get("total_usage_sec", 0)
+        used = int(u.get("total_usage_sec", 0) or 0)
         remaining = max(0, TRIAL_LIMIT_SEC - used)
         if remaining <= 0:
             return {"status": "expired", "remaining": 0}
         return {"status": "active", "remaining": remaining}
 
+    # Licensed OK (we already accumulated time above if last_start existed)
     return {"status": "ok", "user_type": "licensed"}
 
 # ============================================================
-# START/STOP SESSIONS
+# START/STOP Trial Session
 # ============================================================
 @app.post("/start_trial_session")
 def start_trial_session(data: HWIDModel):
@@ -321,7 +341,7 @@ def stop_trial_session(data: HWIDModel):
     last_start = u.get("last_start_time")
     if last_start:
         elapsed = now - last_start
-        total_usage = u.get("total_usage_sec", 0) + elapsed
+        total_usage = int(u.get("total_usage_sec", 0) or 0) + elapsed
 
         collection.update_one(
             {"hwid": data.hwid},
@@ -329,6 +349,9 @@ def stop_trial_session(data: HWIDModel):
         )
     return {"status": "stopped"}
 
+# ============================================================
+# START/STOP Licensed Session
+# ============================================================
 @app.post("/start_session")
 def start_session(data: HWIDModel):
     now = int(time.time())
@@ -349,7 +372,7 @@ def stop_session(data: HWIDModel):
     last_start = u.get("last_start_time")
     if last_start:
         elapsed = now - last_start
-        total_usage = u.get("total_usage_sec", 0) + elapsed
+        total_usage = int(u.get("total_usage_sec", 0) or 0) + elapsed
 
         collection.update_one(
             {"hwid": data.hwid},
