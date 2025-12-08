@@ -1,4 +1,4 @@
-# CF AutoText License Server (SERVER FULL)
+# CF AutoText License Server (SERVER — userslist returns live total_usage_sec)
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
@@ -10,7 +10,7 @@ app = FastAPI(title="CF AutoText License Server")
 # -------------------------
 # MongoDB Setup
 # -------------------------
-# (ใช้ค่าเดิมที่คุณให้ไว้ — ระวัง credentials ถ้าจะแชร์ public)
+# ระวัง: คุณให้ URI มาโดยตรงแล้ว ถ้าจะแชร์ที่สาธารณะให้เปลี่ยนก่อน
 MONGO_URI = "mongodb+srv://MOOQU:SIRIMEEMAK@cluster0.crufku8.mongodb.net/cf_license_db?retryWrites=true&w=majority"
 DB_NAME = "cf_license_db"
 
@@ -74,6 +74,8 @@ def root():
 
 # ============================================================
 # USERS LIST (Admin)
+#  - compute live total_usage_sec if last_start_time exists (do NOT persist)
+#  - include 'remaining' (seconds) for trials to help GUI
 # ============================================================
 @app.get("/userslist")
 def userslist():
@@ -81,15 +83,39 @@ def userslist():
     now = int(time.time())
 
     for u in users:
-        last_seen = u.get("last_seen", 0)
+        # ensure last_seen/last_heartbeat present
+        last_seen = int(u.get("last_seen", 0) or 0)
+        if "last_heartbeat" not in u:
+            u["last_heartbeat"] = u.get("last_seen", last_seen)
+
+        # online boolean
         u["online"] = (now - last_seen <= ONLINE_THRESHOLD)
 
-        if u.get("trial"):
-            elapsed = u.get("total_usage_sec", 0)
-            if u.get("last_start_time"):
-                elapsed += now - u["last_start_time"]
-            u["trial_remaining_minutes"] = max(0, (TRIAL_LIMIT_SEC - elapsed) // 60)
+        # compute live total usage: DB stores total_usage_sec (accumulated) and last_start_time (if running session)
+        base_total = int(u.get("total_usage_sec", 0) or 0)
+        last_start = u.get("last_start_time")
+        if last_start:
+            try:
+                # last_start might be stored as int or str; be defensive
+                last_start_int = int(last_start)
+                extra = max(0, now - last_start_int)
+            except Exception:
+                extra = 0
+            computed_total = base_total + extra
         else:
+            computed_total = base_total
+
+        # expose computed value under the same key so admin GUI can read total_usage_sec directly
+        u["total_usage_sec"] = computed_total
+
+        # if trial: compute remaining seconds (and minutes for backward compatibility)
+        if u.get("trial"):
+            elapsed = computed_total
+            remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
+            u["remaining"] = remaining
+            u["trial_remaining_minutes"] = max(0, remaining // 60)
+        else:
+            u["remaining"] = None
             u["trial_remaining_minutes"] = "-"
 
     return {"users": users}
@@ -123,7 +149,7 @@ def gen_license(user: UsernameModel):
 
 # ============================================================
 # DELETE USER
-# ============================================================
+# ============================================================ 
 @app.post("/usersdelete")
 def delete_user(user: UsernameModel):
     result = collection.delete_one({"username": user.username})
@@ -132,9 +158,10 @@ def delete_user(user: UsernameModel):
     return {"status": "success"}
 
 # ============================================================
-# CHECK LICENSE (NOW REMOVES TRIAL WHEN HWID MATCH)
-# - Binds HWID if empty
-# - Starts licensed session (sets last_start_time) so total_usage_sec will be tracked
+# CHECK LICENSE
+#  - remove trial record with same HWID (if any)
+#  - bind hwid if empty
+#  - update last_seen/last_heartbeat and set last_start_time if missing so licensed time is tracked
 # ============================================================
 @app.post("/check_license")
 def check_license(req: LicenseCheck):
@@ -145,28 +172,27 @@ def check_license(req: LicenseCheck):
     if u.get("banned"):
         return {"status": "invalid", "message": "บัญชีถูกแบน"}
 
-    # ----- If there's a trial record with same HWID, remove it (convert-like behavior) -----
+    # remove trial record for same hwid to avoid duplicate listing
     trial_user = collection.find_one({"hwid": req.hwid, "trial": True})
     if trial_user:
-        # remove the trial record so it doesn't show up alongside the licensed record
         collection.delete_one({"hwid": req.hwid})
 
-    # Bind HWID first time for licensed user
     now = int(time.time())
+    # bind hwid if empty
     if not u.get("hwid"):
         collection.update_one(
             {"username": req.username},
             {"$set": {"hwid": req.hwid, "last_seen": now, "last_heartbeat": now, "last_start_time": now}}
         )
     else:
-        # If HWID exists but different -> invalid
+        # check mismatch
         if u["hwid"] != req.hwid:
             return {"status": "invalid", "message": "HWID ไม่ตรง"}
-        # update online + ensure last_start_time is set to start counting if missing
-        update_doc = {"last_seen": now, "last_heartbeat": now}
+        # update online and ensure last_start_time exists
+        upd = {"last_seen": now, "last_heartbeat": now}
         if not u.get("last_start_time"):
-            update_doc["last_start_time"] = now
-        collection.update_one({"username": req.username}, {"$set": update_doc})
+            upd["last_start_time"] = now
+        collection.update_one({"username": req.username}, {"$set": upd})
 
     return {"status": "valid"}
 
@@ -179,6 +205,7 @@ def request_trial(data: TrialRequestModel):
     now = int(time.time())
     u = collection.find_one({"hwid": hwid})
 
+    # create new trial record if none exists
     if not u:
         tid = get_next_trial_id()
         username = f"TRIAL USER {tid}"
@@ -199,20 +226,24 @@ def request_trial(data: TrialRequestModel):
         })
         return {"status": "active", "username": username, "remaining": TRIAL_LIMIT_SEC}
 
+    # banned
     if u.get("banned"):
         return {"status": "banned", "remaining": 0}
 
+    # still in trial
     if u.get("trial"):
-        elapsed = u.get("total_usage_sec", 0)
+        elapsed = int(u.get("total_usage_sec", 0) or 0)
         if u.get("last_start_time"):
-            elapsed += now - u["last_start_time"]
+            try:
+                elapsed += int(time.time()) - int(u.get("last_start_time"))
+            except Exception:
+                pass
 
         remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
         collection.update_one({"hwid": hwid}, {"$set": {"last_seen": now}})
 
         if remaining <= 0:
             return {"status": "expired", "remaining": 0}
-
         return {"status": "active", "username": u["username"], "remaining": remaining}
 
     return {"status": "expired", "remaining": 0}
@@ -232,13 +263,16 @@ def check_trial(data: HWIDModel):
     if not u.get("trial"):
         return {"status": "licensed", "remaining": None}
 
-    elapsed = u.get("total_usage_sec", 0)
+    elapsed = int(u.get("total_usage_sec", 0) or 0)
     if u.get("last_start_time"):
-        elapsed += now - u["last_start_time"]
+        try:
+            elapsed += now - int(u.get("last_start_time"))
+        except Exception:
+            pass
 
     remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
 
-    # online update
+    # online update (so admin shows online)
     collection.update_one(
         {"hwid": data.hwid},
         {"$set": {"last_seen": now, "last_heartbeat": now}}
@@ -246,7 +280,6 @@ def check_trial(data: HWIDModel):
 
     if remaining <= 0:
         return {"status": "expired", "remaining": 0}
-
     return {"status": "active", "remaining": remaining, "username": u["username"]}
 
 # ============================================================
@@ -267,9 +300,7 @@ def unban(data: HWIDModel):
     return {"status": "success"}
 
 # ============================================================
-# HEARTBEAT (FIXED: count time for both trial & licensed)
-# - Update last_seen/last_heartbeat
-# - If last_start_time exists, accumulate elapsed into total_usage_sec and reset last_start_time to now
+# HEARTBEAT (counts time for active session if last_start_time present)
 # ============================================================
 @app.post("/heartbeat")
 def heartbeat(data: HeartbeatModel):
@@ -279,13 +310,13 @@ def heartbeat(data: HeartbeatModel):
     if not u:
         return {"status": "fail", "reason": "user_not_found"}
 
-    # update online fields immediately
+    # update online timestamps immediately
     collection.update_one(
         {"hwid": data.hwid},
         {"$set": {"last_seen": now, "last_heartbeat": now}}
     )
 
-    # fetch fresh record (to read last_start_time and total_usage_sec)
+    # re-fetch to read last_start_time and total_usage_sec
     u = collection.find_one({"hwid": data.hwid})
 
     last_start = u.get("last_start_time")
@@ -296,18 +327,13 @@ def heartbeat(data: HeartbeatModel):
                 elapsed = 0
         except Exception:
             elapsed = 0
-
         total_usage = int(u.get("total_usage_sec", 0) or 0) + elapsed
-
         collection.update_one(
             {"hwid": data.hwid},
-            {"$set": {
-                "total_usage_sec": total_usage,
-                "last_start_time": now
-            }}
+            {"$set": {"total_usage_sec": total_usage, "last_start_time": now}}
         )
 
-    # Trial-specific response
+    # trial logic response
     if u.get("trial"):
         used = int(u.get("total_usage_sec", 0) or 0)
         remaining = max(0, TRIAL_LIMIT_SEC - used)
@@ -315,7 +341,7 @@ def heartbeat(data: HeartbeatModel):
             return {"status": "expired", "remaining": 0}
         return {"status": "active", "remaining": remaining}
 
-    # Licensed OK (we already accumulated time above if last_start existed)
+    # licensed
     return {"status": "ok", "user_type": "licensed"}
 
 # ============================================================
@@ -340,9 +366,13 @@ def stop_trial_session(data: HWIDModel):
 
     last_start = u.get("last_start_time")
     if last_start:
-        elapsed = now - last_start
+        try:
+            elapsed = now - int(last_start)
+            if elapsed < 0:
+                elapsed = 0
+        except Exception:
+            elapsed = 0
         total_usage = int(u.get("total_usage_sec", 0) or 0) + elapsed
-
         collection.update_one(
             {"hwid": data.hwid},
             {"$set": {"total_usage_sec": total_usage, "last_start_time": None}}
@@ -371,9 +401,13 @@ def stop_session(data: HWIDModel):
 
     last_start = u.get("last_start_time")
     if last_start:
-        elapsed = now - last_start
+        try:
+            elapsed = now - int(last_start)
+            if elapsed < 0:
+                elapsed = 0
+        except Exception:
+            elapsed = 0
         total_usage = int(u.get("total_usage_sec", 0) or 0) + elapsed
-
         collection.update_one(
             {"hwid": data.hwid},
             {"$set": {"total_usage_sec": total_usage, "last_start_time": None}}
