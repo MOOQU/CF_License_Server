@@ -11,7 +11,6 @@ app = FastAPI(title="CF AutoText License Server")
 # -------------------------
 # MongoDB Setup
 # -------------------------
-# ระวัง: คุณให้ URI มาโดยตรงแล้ว ถ้าจะแชร์ที่สาธารณะให้เปลี่ยนก่อน
 MONGO_URI = "mongodb+srv://MOOQU:SIRIMEEMAK@cluster0.crufku8.mongodb.net/cf_license_db?retryWrites=true&w=majority"
 DB_NAME = "cf_license_db"
 
@@ -52,7 +51,7 @@ class DaysModel(BaseModel):
 # -------------------------
 TRIAL_LIMIT_SEC = 7200          # 2 hours
 ONLINE_THRESHOLD = 160          # admin GUI uses 160 sec
-SESSION_HISTORY_LIMIT = 10      # how many session entries to keep per user (to avoid unbounded growth)
+SESSION_HISTORY_LIMIT = 50      # how many session entries to keep per user (to avoid unbounded growth)
 SESSION_HISTORY_RETENTION_DAYS = 7  # retention window for session_history (7 days)
 
 # -------------------------
@@ -123,14 +122,11 @@ def ensure_timestamps_for_existing_users():
         if "created_at" not in u:
             updates["created_at"] = now
         if u.get("user_type") == "licensed" and "license_activated_at" not in u:
-            # If there's any existing 'last_start_time' or total_usage > 0, we consider this "activated" at now (can't know real past).
             updates["license_activated_at"] = now
         if u.get("user_type") == "trial" and "trial_started_at" not in u:
             updates["trial_started_at"] = now
-        # ensure session_history field exists
         if "session_history" not in u:
             updates["session_history"] = u.get("session_history", [])
-        # ensure opened_at/closed_at keys exist (may be None)
         if "opened_at" not in u:
             updates["opened_at"] = u.get("opened_at", None)
         if "closed_at" not in u:
@@ -142,7 +138,6 @@ def ensure_timestamps_for_existing_users():
 try:
     ensure_timestamps_for_existing_users()
 except Exception:
-    # If Mongo can't be reached at import time, this will be retried on actual endpoint calls; keep server running.
     pass
 
 # ============================================================
@@ -240,6 +235,9 @@ def userslist():
         u["banned"] = bool(u.get("banned", False))
         u["user_type"] = u.get("user_type")
 
+        # clean old sessions if necessary
+        clean_old_sessions_for_user(u["username"], days=SESSION_HISTORY_RETENTION_DAYS)
+
         out_users.append(u)
 
     return {"users": out_users}
@@ -250,7 +248,7 @@ def userslist():
 @app.post("/usersgen_license")
 def gen_license(user: UsernameModel):
     if collection.find_one({"username": user.username}):
-        raise HTTPException(status_code=400, detail="User มีอยู่แล้ว")
+        raise HTTPException(status_code=400, detail="User already exists")
 
     license_key = gen_license_key()
     now = now_ts()
@@ -268,10 +266,8 @@ def gen_license(user: UsernameModel):
         "last_seen": now,
         "last_heartbeat": now,
         "user_type": "licensed",
-        # new timestamp fields
         "created_at": now,
         "license_activated_at": now,
-        # session tracking
         "opened_at": None,
         "closed_at": None,
         "session_history": []
@@ -287,58 +283,33 @@ def gen_license(user: UsernameModel):
 def delete_user(user: UsernameModel):
     result = collection.delete_one({"username": user.username})
     if result.deleted_count == 0:
-        raise HTTPException(status_code=400, detail="User ไม่พบ")
+        raise HTTPException(status_code=400, detail="User not found")
     return {"status": "success"}
 
 # ============================================================
 # CHECK LICENSE
-#  - remove trial record with same HWID (if any)
-#  - bind hwid if empty
-#  - update last_seen/last_heartbeat and set last_start_time if missing so licensed time is tracked
-#  - when starting session, set opened_at if not set
 # ============================================================
 @app.post("/check_license")
 def check_license(req: LicenseCheck):
     u = collection.find_one({"username": req.username, "license": req.license})
     if not u:
-        return {"status": "invalid", "message": "License ไม่ถูกต้อง"}
+        return {"status": "invalid", "message": "License not valid"}
 
     if u.get("banned"):
-        return {"status": "invalid", "message": "บัญชีถูกแบน"}
-
-    # remove trial record for same hwid to avoid duplicate listing
-    trial_user = collection.find_one({"hwid": req.hwid, "trial": True})
-    if trial_user:
-        collection.delete_one({"hwid": req.hwid})
+        return {"status": "invalid", "message": "Account is banned"}
 
     now = now_ts()
-    # bind hwid if empty
+
     if not u.get("hwid"):
         collection.update_one(
             {"username": req.username},
-            {"$set": {
-                "hwid": req.hwid,
-                "last_seen": now,
-                "last_heartbeat": now,
-                "last_start_time": now,
-                "opened_at": now,
-                "closed_at": None,
-                "created_at": u.get("created_at", now),
-                "license_activated_at": u.get("license_activated_at", now)
-            }}
+            {"$set": {"hwid": req.hwid, "last_seen": now, "last_heartbeat": now, "last_start_time": now, "opened_at": now, "closed_at": None}}
         )
     else:
-        # check mismatch
         if u["hwid"] != req.hwid:
-            return {"status": "invalid", "message": "HWID ไม่ตรง"}
-        # update online and ensure last_start_time exists
-        upd = {"last_seen": now, "last_heartbeat": now}
-        if not u.get("last_start_time"):
-            upd["last_start_time"] = now
-            upd["opened_at"] = now
-            upd["closed_at"] = None
-        collection.update_one({"username": req.username}, {"$set": upd})
-
+            return {"status": "invalid", "message": "HWID mismatch"}
+        collection.update_one({"username": req.username}, {"$set": {"last_seen": now, "last_heartbeat": now}})
+    
     return {"status": "valid"}
 
 # ============================================================
@@ -350,7 +321,6 @@ def request_trial(data: TrialRequestModel):
     now = now_ts()
     u = collection.find_one({"hwid": hwid})
 
-    # create new trial record if none exists
     if not u:
         tid = get_next_trial_id()
         username = f"TRIAL USER {tid}"
@@ -377,19 +347,13 @@ def request_trial(data: TrialRequestModel):
         collection.insert_one(doc)
         return {"status": "active", "username": username, "remaining": TRIAL_LIMIT_SEC}
 
-    # banned
     if u.get("banned"):
         return {"status": "banned", "remaining": 0}
 
-    # still in trial
     if u.get("trial"):
-        # compute elapsed including running session if any
         elapsed = int(u.get("total_usage_sec", 0) or 0)
         if u.get("last_start_time"):
-            try:
-                elapsed += int(time.time()) - int(u.get("last_start_time"))
-            except Exception:
-                pass
+            elapsed += int(time.time()) - int(u["last_start_time"])
 
         remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
         collection.update_one({"hwid": hwid}, {"$set": {"last_seen": now, "last_heartbeat": now}})
@@ -451,10 +415,7 @@ def unban(data: HWIDModel):
     return {"status": "success"}
 
 # ============================================================
-# HEARTBEAT (counts time for active session if last_start_time present)
-#  - update last_seen/last_heartbeat immediately
-#  - if last_start_time exists we compute elapsed and add to total_usage_sec and reset last_start_time to now
-#  - keep opened_at/closed_at semantics (opened_at set when session starts, closed_at cleared while running)
+# HEARTBEAT
 # ============================================================
 @app.post("/heartbeat")
 def heartbeat(data: HeartbeatModel):
@@ -464,13 +425,11 @@ def heartbeat(data: HeartbeatModel):
     if not u:
         return {"status": "fail", "reason": "user_not_found"}
 
-    # update online timestamps immediately
     collection.update_one(
         {"hwid": data.hwid},
         {"$set": {"last_seen": now, "last_heartbeat": now}}
     )
 
-    # re-fetch to read last_start_time and total_usage_sec
     u = collection.find_one({"hwid": data.hwid})
 
     last_start = u.get("last_start_time")
@@ -483,17 +442,14 @@ def heartbeat(data: HeartbeatModel):
             elapsed = 0
         total_usage = int(u.get("total_usage_sec", 0) or 0) + elapsed
 
-        # update total_usage_sec and bump last_start_time to now (continue running session)
         collection.update_one(
             {"hwid": data.hwid},
             {"$set": {"total_usage_sec": total_usage, "last_start_time": now, "opened_at": u.get("opened_at", now), "closed_at": None}}
         )
 
-    # trial logic response
     u = collection.find_one({"hwid": data.hwid})
     if u and u.get("trial"):
         used = int(u.get("total_usage_sec", 0) or 0)
-        # if there's a running session, elapsed already added above; computed remaining:
         remaining = max(0, TRIAL_LIMIT_SEC - used)
         if remaining <= 0:
             return {"status": "expired", "remaining": 0}
@@ -503,8 +459,6 @@ def heartbeat(data: HeartbeatModel):
 
 # ============================================================
 # START/STOP Trial Session
-#  - set opened_at when session starts; clear closed_at
-#  - on stop: compute elapsed, update total_usage_sec, set closed_at, append to session_history
 # ============================================================
 @app.post("/start_trial_session")
 def start_trial_session(data: HWIDModel):
@@ -532,25 +486,18 @@ def stop_trial_session(data: HWIDModel):
         except Exception:
             elapsed = 0
         total_usage = int(u.get("total_usage_sec", 0) or 0) + elapsed
-        # append session_history
         hist = u.get("session_history", []) or []
         hist = append_session_history(u, int(last_start), now)
         collection.update_one(
             {"hwid": data.hwid},
             {"$set": {"total_usage_sec": total_usage, "last_start_time": None, "closed_at": now, "opened_at": u.get("opened_at")}, "$setOnInsert": {}}
         )
-        # update session_history separately to avoid race overwrite issues
         collection.update_one({"hwid": data.hwid}, {"$set": {"session_history": hist}})
-        # clean sessions older than retention window (e.g. 7 days)
-        if u.get("username"):
-            clean_old_sessions_for_user(u["username"], days=SESSION_HISTORY_RETENTION_DAYS)
+        clean_old_sessions_for_user(u["username"], days=SESSION_HISTORY_RETENTION_DAYS)
     return {"status": "stopped"}
 
 # ============================================================
 # START/STOP Licensed Session
-#  - same as trial but for licensed users
-#  - when starting, set opened_at if none; clear closed_at
-#  - when stopping, compute elapsed, append session, set closed_at
 # ============================================================
 @app.post("/start_session")
 def start_session(data: HWIDModel):
@@ -559,7 +506,6 @@ def start_session(data: HWIDModel):
     if not u:
         raise HTTPException(status_code=404, detail="User ไม่พบ")
 
-    # if already running, just update last_start_time to now (or keep)
     collection.update_one({"hwid": data.hwid}, {"$set": {"last_start_time": now, "opened_at": now, "closed_at": None}})
     return {"status": "started"}
 
@@ -585,20 +531,15 @@ def stop_session(data: HWIDModel):
             {"$set": {"total_usage_sec": total_usage, "last_start_time": None, "closed_at": now}}
         )
         collection.update_one({"hwid": data.hwid}, {"$set": {"session_history": hist}})
-        # clean sessions older than retention window (e.g. 7 days)
-        if u.get("username"):
-            clean_old_sessions_for_user(u["username"], days=SESSION_HISTORY_RETENTION_DAYS)
+        clean_old_sessions_for_user(u["username"], days=SESSION_HISTORY_RETENTION_DAYS)
     return {"status": "stopped"}
 
 # ============================================================
 # Optional: endpoint to fetch logs (simple)
-#  - this endpoint can be used by Admin GUI to fetch human-readable logs
-#  - it compiles recent sessions for all users (last N entries)
 # ============================================================
 @app.get("/logs")
 def logs(limit: int = 200):
     """Return a simple logs view: recent session starts/stops and important events."""
-    # We'll create a simple list of events from session_history and created_at/license events.
     users = list(collection.find({}, {"username": 1, "session_history": 1, "created_at": 1, "license_activated_at": 1, "trial_started_at": 1, "banned": 1, "hwid": 1, "_id": 0}))
     events = []
     for u in users:
@@ -614,9 +555,7 @@ def logs(limit: int = 200):
         for s in (u.get("session_history") or [])[-10:]:
             events.append({"ts": int(s.get("start")), "type": "session_start", "username": username, "hwid": hwid})
             events.append({"ts": int(s.get("end")), "type": "session_end", "username": username, "hwid": hwid})
-    # sort events by ts desc
     events_sorted = sorted(events, key=lambda x: x["ts"], reverse=True)[:limit]
-    # human readable mapping
     for e in events_sorted:
         e["time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["ts"]))
     return {"events": events_sorted}
@@ -640,7 +579,6 @@ def user_session_history(username: str, days: int = SESSION_HISTORY_RETENTION_DA
         for s in hist
         if s.get("end", 0) >= cutoff
     ]
-    # return newest first
     filtered_sorted = sorted(filtered, key=lambda x: x["start"], reverse=True)
     return {"history": filtered_sorted}
 
