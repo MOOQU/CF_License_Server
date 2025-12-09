@@ -52,7 +52,7 @@ class DaysModel(BaseModel):
 # -------------------------
 TRIAL_LIMIT_SEC = 7200          # 2 hours
 ONLINE_THRESHOLD = 160          # admin GUI uses 160 sec
-SESSION_HISTORY_LIMIT = 10      # how many session entries to keep per user (to avoid unbounded growth)
+SESSION_HISTORY_LIMIT = 50      # how many session entries to keep per user (to avoid unbounded growth)
 SESSION_HISTORY_RETENTION_DAYS = 7  # retention window for session_history (7 days)
 
 # -------------------------
