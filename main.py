@@ -44,12 +44,16 @@ class HeartbeatModel(BaseModel):
     username: Optional[str] = None
     mode: Optional[str] = None   # "trial" / "licensed"
 
+class DaysModel(BaseModel):
+    days: int
+
 # -------------------------
 # Settings
 # -------------------------
 TRIAL_LIMIT_SEC = 7200          # 2 hours
 ONLINE_THRESHOLD = 160          # admin GUI uses 160 sec
-SESSION_HISTORY_LIMIT = 50      # how many session entries to keep per user (to avoid unbounded growth)
+SESSION_HISTORY_LIMIT = 10      # how many session entries to keep per user (to avoid unbounded growth)
+SESSION_HISTORY_RETENTION_DAYS = 7  # retention window for session_history (7 days)
 
 # -------------------------
 # Helpers
@@ -77,6 +81,35 @@ def append_session_history(user_doc: Dict[str, Any], start: int, end: int):
     # keep only the latest SESSION_HISTORY_LIMIT entries
     hist = hist[-SESSION_HISTORY_LIMIT:]
     return hist
+
+def clean_old_sessions_for_user(username: str, days: int = SESSION_HISTORY_RETENTION_DAYS):
+    """
+    Remove session_history entries for a user older than `days`.
+    This enforces the time-based retention (e.g. 7 days).
+    """
+    cutoff = now_ts() - (days * 24 * 60 * 60)
+    u = collection.find_one({"username": username})
+    if not u:
+        return
+    hist = u.get("session_history", []) or []
+    new_hist = [s for s in hist if s.get("end", 0) >= cutoff]
+    # Also trim to SESSION_HISTORY_LIMIT for safety
+    new_hist = new_hist[-SESSION_HISTORY_LIMIT:]
+    if len(new_hist) != len(hist):
+        collection.update_one({"username": username}, {"$set": {"session_history": new_hist}})
+
+def clean_old_sessions_global(days: int = SESSION_HISTORY_RETENTION_DAYS):
+    """
+    Iterate all users and remove session_history entries older than `days`.
+    Use cautiously (it's a DB operation over all users).
+    """
+    cutoff = now_ts() - (days * 24 * 60 * 60)
+    for u in collection.find({}, {"username": 1, "session_history": 1}):
+        hist = u.get("session_history", []) or []
+        new_hist = [s for s in hist if s.get("end", 0) >= cutoff]
+        new_hist = new_hist[-SESSION_HISTORY_LIMIT:]
+        if len(new_hist) != len(hist):
+            collection.update_one({"username": u["username"]}, {"$set": {"session_history": new_hist}})
 
 def ensure_timestamps_for_existing_users():
     """Backfill created_at / license_activated_at / trial_started_at for existing users without them.
@@ -171,7 +204,9 @@ def userslist():
         # session info:
         # prefer the explicit session_history/last session fields if present
         session_history = u.get("session_history", []) or []
-        u["session_history"] = session_history[-SESSION_HISTORY_LIMIT:]  # trimming to limit
+        # trim to SESSION_HISTORY_LIMIT for safety, client will request history endpoints for time-range filtering
+        session_history = session_history[-SESSION_HISTORY_LIMIT:]
+        u["session_history"] = session_history
 
         # determine last_opened_at and last_closed_at
         # If user has explicit opened_at/closed_at fields, use them. Otherwise fallback to heuristics.
@@ -506,6 +541,9 @@ def stop_trial_session(data: HWIDModel):
         )
         # update session_history separately to avoid race overwrite issues
         collection.update_one({"hwid": data.hwid}, {"$set": {"session_history": hist}})
+        # clean sessions older than retention window (e.g. 7 days)
+        if u.get("username"):
+            clean_old_sessions_for_user(u["username"], days=SESSION_HISTORY_RETENTION_DAYS)
     return {"status": "stopped"}
 
 # ============================================================
@@ -547,6 +585,9 @@ def stop_session(data: HWIDModel):
             {"$set": {"total_usage_sec": total_usage, "last_start_time": None, "closed_at": now}}
         )
         collection.update_one({"hwid": data.hwid}, {"$set": {"session_history": hist}})
+        # clean sessions older than retention window (e.g. 7 days)
+        if u.get("username"):
+            clean_old_sessions_for_user(u["username"], days=SESSION_HISTORY_RETENTION_DAYS)
     return {"status": "stopped"}
 
 # ============================================================
@@ -579,6 +620,55 @@ def logs(limit: int = 200):
     for e in events_sorted:
         e["time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["ts"]))
     return {"events": events_sorted}
+
+# ============================================================
+# NEW: user session history endpoint (time-filtered)
+# ============================================================
+@app.get("/user_session_history")
+def user_session_history(username: str, days: int = SESSION_HISTORY_RETENTION_DAYS):
+    """
+    Return session entries for a user filtered by a retention window (days).
+    Default days uses SESSION_HISTORY_RETENTION_DAYS.
+    """
+    cutoff = now_ts() - (days * 24 * 60 * 60)
+    u = collection.find_one({"username": username}, {"session_history": 1, "_id": 0})
+    if not u:
+        return {"history": []}
+    hist = u.get("session_history", []) or []
+    filtered = [
+        {"start": s.get("start"), "end": s.get("end"), "length": (s.get("end", 0) - s.get("start", 0))}
+        for s in hist
+        if s.get("end", 0) >= cutoff
+    ]
+    # return newest first
+    filtered_sorted = sorted(filtered, key=lambda x: x["start"], reverse=True)
+    return {"history": filtered_sorted}
+
+# ============================================================
+# NEW: Clear logs endpoints
+# ============================================================
+@app.post("/clear_user_logs")
+def clear_user_logs(payload: UsernameModel):
+    username = payload.username
+    collection.update_one({"username": username}, {"$set": {"session_history": []}})
+    return {"status": "ok", "message": f"Logs cleared for {username}"}
+
+@app.post("/clear_all_logs")
+def clear_all_logs():
+    collection.update_many({}, {"$set": {"session_history": []}})
+    return {"status": "ok", "message": "All logs cleared"}
+
+@app.post("/clear_logs_days")
+def clear_logs_days(payload: DaysModel):
+    days = int(payload.days)
+    cutoff = now_ts() - (days * 24 * 60 * 60)
+    for u in collection.find({}, {"username": 1, "session_history": 1}):
+        hist = u.get("session_history", []) or []
+        new_hist = [s for s in hist if s.get("end", 0) >= cutoff]
+        new_hist = new_hist[-SESSION_HISTORY_LIMIT:]
+        if len(new_hist) != len(hist):
+            collection.update_one({"username": u["username"]}, {"$set": {"session_history": new_hist}})
+    return {"status": "ok", "message": f"Cleared sessions older than {days} days"}
 
 # ============================================================
 # End of file
