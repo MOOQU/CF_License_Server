@@ -513,6 +513,11 @@ def start_trial_session(data: HWIDModel):
     if not u or not u.get("trial"):
         raise HTTPException(status_code=404, detail="Trial ไม่พบ")
 
+    # If already running, do not reset last_start_time — just ensure opened_at set
+    if u.get("last_start_time"):
+        collection.update_one({"hwid": data.hwid}, {"$set": {"opened_at": u.get("opened_at", now), "closed_at": None}})
+        return {"status": "already_running"}
+
     collection.update_one({"hwid": data.hwid}, {"$set": {"last_start_time": now, "opened_at": now, "closed_at": None}})
     return {"status": "started"}
 
@@ -532,18 +537,22 @@ def stop_trial_session(data: HWIDModel):
         except Exception:
             elapsed = 0
         total_usage = int(u.get("total_usage_sec", 0) or 0) + elapsed
-        # append session_history
+        # append session_history (use original u doc to avoid races)
         hist = u.get("session_history", []) or []
         hist = append_session_history(u, int(last_start), now)
+        # update accumulated usage and clear running flag
         collection.update_one(
             {"hwid": data.hwid},
-            {"$set": {"total_usage_sec": total_usage, "last_start_time": None, "closed_at": now, "opened_at": u.get("opened_at")}, "$setOnInsert": {}}
+            {"$set": {"total_usage_sec": total_usage, "last_start_time": None, "closed_at": now, "opened_at": u.get("opened_at")}}
         )
         # update session_history separately to avoid race overwrite issues
         collection.update_one({"hwid": data.hwid}, {"$set": {"session_history": hist}})
         # clean sessions older than retention window (e.g. 7 days)
         if u.get("username"):
             clean_old_sessions_for_user(u["username"], days=SESSION_HISTORY_RETENTION_DAYS)
+    else:
+        # No running session — still ensure closed_at is set to now (idempotent)
+        collection.update_one({"hwid": data.hwid}, {"$set": {"closed_at": now, "last_start_time": None}})
     return {"status": "stopped"}
 
 # ============================================================
@@ -559,7 +568,13 @@ def start_session(data: HWIDModel):
     if not u:
         raise HTTPException(status_code=404, detail="User ไม่พบ")
 
-    # if already running, just update last_start_time to now (or keep)
+    # If session already running don't reset last_start_time (avoid erasing original start)
+    if u.get("last_start_time"):
+        # ensure opened_at exists and closed_at cleared
+        collection.update_one({"hwid": data.hwid}, {"$set": {"opened_at": u.get("opened_at", now), "closed_at": None}})
+        return {"status": "already_running"}
+
+    # start new session
     collection.update_one({"hwid": data.hwid}, {"$set": {"last_start_time": now, "opened_at": now, "closed_at": None}})
     return {"status": "started"}
 
@@ -579,15 +594,22 @@ def stop_session(data: HWIDModel):
         except Exception:
             elapsed = 0
         total_usage = int(u.get("total_usage_sec", 0) or 0) + elapsed
+        # Build new history entry from the last_start we fetched from DB
+        hist = u.get("session_history", []) or []
         hist = append_session_history(u, int(last_start), now)
+        # apply updates: accumulate usage, clear running flag, set closed_at
         collection.update_one(
             {"hwid": data.hwid},
             {"$set": {"total_usage_sec": total_usage, "last_start_time": None, "closed_at": now}}
         )
+        # store session_history separately to avoid overwrite races
         collection.update_one({"hwid": data.hwid}, {"$set": {"session_history": hist}})
         # clean sessions older than retention window (e.g. 7 days)
         if u.get("username"):
             clean_old_sessions_for_user(u["username"], days=SESSION_HISTORY_RETENTION_DAYS)
+    else:
+        # No running session found — idempotent set closed_at
+        collection.update_one({"hwid": data.hwid}, {"$set": {"closed_at": now, "last_start_time": None}})
     return {"status": "stopped"}
 
 # ============================================================
