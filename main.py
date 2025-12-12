@@ -228,6 +228,9 @@ def userslist():
         u["last_opened_at"] = last_opened
         u["last_closed_at"] = last_closed
 
+        u["opened_at"] = last_opened
+        u["closed_at"] = last_closed
+
         # ensure created_at/license/trial timestamps present in returned object
         u["created_at"] = u.get("created_at")
         u["license_activated_at"] = u.get("license_activated_at")
