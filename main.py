@@ -1,4 +1,4 @@
-# CF AutoText License Server (SERVER — userslist returns live total_usage_sec + session logs)
+# CF AutoText License Server (FIXED — no duplicate time counting)
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
@@ -11,7 +11,6 @@ app = FastAPI(title="CF AutoText License Server")
 # -------------------------
 # MongoDB Setup
 # -------------------------
-# ระวัง: คุณให้ URI มาโดยตรงแล้ว ถ้าจะแชร์ที่สาธารณะให้เปลี่ยนก่อน
 MONGO_URI = "mongodb+srv://MOOQU:SIRIMEEMAK@cluster0.crufku8.mongodb.net/cf_license_db?retryWrites=true&w=majority"
 DB_NAME = "cf_license_db"
 
@@ -42,7 +41,7 @@ class TrialRequestModel(BaseModel):
 class HeartbeatModel(BaseModel):
     hwid: str
     username: Optional[str] = None
-    mode: Optional[str] = None   # "trial" / "licensed"
+    mode: Optional[str] = None
 
 class DaysModel(BaseModel):
     days: int
@@ -50,10 +49,10 @@ class DaysModel(BaseModel):
 # -------------------------
 # Settings
 # -------------------------
-TRIAL_LIMIT_SEC = 7200          # 2 hours
-ONLINE_THRESHOLD = 160          # admin GUI uses 160 sec
-SESSION_HISTORY_LIMIT = 50      # how many session entries to keep per user (to avoid unbounded growth)
-SESSION_HISTORY_RETENTION_DAYS = 7  # retention window for session_history (7 days)
+TRIAL_LIMIT_SEC = 7200
+ONLINE_THRESHOLD = 160
+SESSION_HISTORY_LIMIT = 50
+SESSION_HISTORY_RETENTION_DAYS = 7
 
 # -------------------------
 # Helpers
@@ -78,31 +77,21 @@ def append_session_history(user_doc: Dict[str, Any], start: int, end: int):
     """Append a session dict to session_history (server-side). Keep size bounded."""
     hist = user_doc.get("session_history") or []
     hist.append({"start": int(start), "end": int(end)})
-    # keep only the latest SESSION_HISTORY_LIMIT entries
     hist = hist[-SESSION_HISTORY_LIMIT:]
     return hist
 
 def clean_old_sessions_for_user(username: str, days: int = SESSION_HISTORY_RETENTION_DAYS):
-    """
-    Remove session_history entries for a user older than `days`.
-    This enforces the time-based retention (e.g. 7 days).
-    """
     cutoff = now_ts() - (days * 24 * 60 * 60)
     u = collection.find_one({"username": username})
     if not u:
         return
     hist = u.get("session_history", []) or []
     new_hist = [s for s in hist if s.get("end", 0) >= cutoff]
-    # Also trim to SESSION_HISTORY_LIMIT for safety
     new_hist = new_hist[-SESSION_HISTORY_LIMIT:]
     if len(new_hist) != len(hist):
         collection.update_one({"username": username}, {"$set": {"session_history": new_hist}})
 
 def clean_old_sessions_global(days: int = SESSION_HISTORY_RETENTION_DAYS):
-    """
-    Iterate all users and remove session_history entries older than `days`.
-    Use cautiously (it's a DB operation over all users).
-    """
     cutoff = now_ts() - (days * 24 * 60 * 60)
     for u in collection.find({}, {"username": 1, "session_history": 1}):
         hist = u.get("session_history", []) or []
@@ -112,25 +101,18 @@ def clean_old_sessions_global(days: int = SESSION_HISTORY_RETENTION_DAYS):
             collection.update_one({"username": u["username"]}, {"$set": {"session_history": new_hist}})
 
 def ensure_timestamps_for_existing_users():
-    """Backfill created_at / license_activated_at / trial_started_at for existing users without them.
-       This is safe: it will set timestamps to 'now' only if the fields don't exist.
-    """
     now = now_ts()
     users = collection.find({})
-    ops = []
     for u in users:
         updates = {}
         if "created_at" not in u:
             updates["created_at"] = now
         if u.get("user_type") == "licensed" and "license_activated_at" not in u:
-            # If there's any existing 'last_start_time' or total_usage > 0, we consider this "activated" at now (can't know real past).
             updates["license_activated_at"] = now
         if u.get("user_type") == "trial" and "trial_started_at" not in u:
             updates["trial_started_at"] = now
-        # ensure session_history field exists
         if "session_history" not in u:
             updates["session_history"] = u.get("session_history", [])
-        # ensure opened_at/closed_at keys exist (may be None)
         if "opened_at" not in u:
             updates["opened_at"] = u.get("opened_at", None)
         if "closed_at" not in u:
@@ -138,11 +120,9 @@ def ensure_timestamps_for_existing_users():
         if updates:
             collection.update_one({"_id": u["_id"]}, {"$set": updates})
 
-# Run one-time backfill on startup
 try:
     ensure_timestamps_for_existing_users()
 except Exception:
-    # If Mongo can't be reached at import time, this will be retried on actual endpoint calls; keep server running.
     pass
 
 # ============================================================
@@ -154,28 +134,21 @@ def root():
 
 # ============================================================
 # USERS LIST (Admin)
-#  - compute live total_usage_sec if last_start_time exists (do NOT persist computed value)
-#  - compute last_opened_at / last_closed_at from session info or heuristic (last_heartbeat + threshold)
-#  - include 'remaining' (seconds) for trials to help GUI
-#  - include session_history (trimmed) and last session info
 # ============================================================
 @app.get("/userslist")
 def userslist():
-    users = list(collection.find({}, {"_id": 0}))  # do not return Mongo _id
+    users = list(collection.find({}, {"_id": 0}))
     now = now_ts()
 
     out_users = []
     for u in users:
-        # defensive defaults
-        u = dict(u)  # copy to avoid mutating original doc
+        u = dict(u)
         last_seen = int(u.get("last_seen", 0) or 0)
         if "last_heartbeat" not in u:
             u["last_heartbeat"] = u.get("last_seen", last_seen)
 
-        # compute online boolean
         u["online"] = (now - last_seen <= ONLINE_THRESHOLD)
 
-        # compute live total usage: DB stores total_usage_sec (accumulated) and last_start_time (if running session)
         base_total = int(u.get("total_usage_sec", 0) or 0)
         last_start = u.get("last_start_time")
         if last_start:
@@ -188,10 +161,8 @@ def userslist():
         else:
             computed_total = base_total
 
-        # expose computed value under the same key so admin GUI can read total_usage_sec directly
         u["total_usage_sec"] = computed_total
 
-        # trial remaining
         if u.get("trial"):
             elapsed = computed_total
             remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
@@ -201,23 +172,16 @@ def userslist():
             u["remaining"] = None
             u["trial_remaining_minutes"] = "-"
 
-        # session info:
-        # prefer the explicit session_history/last session fields if present
         session_history = u.get("session_history", []) or []
-        # trim to SESSION_HISTORY_LIMIT for safety, client will request history endpoints for time-range filtering
         session_history = session_history[-SESSION_HISTORY_LIMIT:]
         u["session_history"] = session_history
 
-        # determine last_opened_at and last_closed_at
-        # If user has explicit opened_at/closed_at fields, use them. Otherwise fallback to heuristics.
         last_opened = u.get("opened_at")
         last_closed = u.get("closed_at")
 
-        # If currently online, we consider closed_at = None (not closed yet).
         if u["online"]:
             last_closed = None
         else:
-            # if closed_at not present or None, compute heuristic from last_heartbeat + threshold
             if not last_closed:
                 last_heartbeat = int(u.get("last_heartbeat", 0) or 0)
                 if last_heartbeat:
@@ -227,16 +191,13 @@ def userslist():
 
         u["last_opened_at"] = last_opened
         u["last_closed_at"] = last_closed
-
         u["opened_at"] = last_opened
         u["closed_at"] = last_closed
 
-        # ensure created_at/license/trial timestamps present in returned object
         u["created_at"] = u.get("created_at")
         u["license_activated_at"] = u.get("license_activated_at")
         u["trial_started_at"] = u.get("trial_started_at")
 
-        # ensure basic fields exist
         u["username"] = u.get("username", "")
         u["license"] = u.get("license", "")
         u["hwid"] = u.get("hwid", "")
@@ -271,10 +232,8 @@ def gen_license(user: UsernameModel):
         "last_seen": now,
         "last_heartbeat": now,
         "user_type": "licensed",
-        # new timestamp fields
         "created_at": now,
         "license_activated_at": now,
-        # session tracking
         "opened_at": None,
         "closed_at": None,
         "session_history": []
@@ -285,7 +244,7 @@ def gen_license(user: UsernameModel):
 
 # ============================================================
 # DELETE USER
-# ============================================================ 
+# ============================================================
 @app.post("/usersdelete")
 def delete_user(user: UsernameModel):
     result = collection.delete_one({"username": user.username})
@@ -295,10 +254,6 @@ def delete_user(user: UsernameModel):
 
 # ============================================================
 # CHECK LICENSE
-#  - remove trial record with same HWID (if any)
-#  - bind hwid if empty
-#  - update last_seen/last_heartbeat and set last_start_time if missing so licensed time is tracked
-#  - when starting session, set opened_at if not set
 # ============================================================
 @app.post("/check_license")
 def check_license(req: LicenseCheck):
@@ -309,13 +264,11 @@ def check_license(req: LicenseCheck):
     if u.get("banned"):
         return {"status": "invalid", "message": "บัญชีถูกแบน"}
 
-    # remove trial record for same hwid to avoid duplicate listing
     trial_user = collection.find_one({"hwid": req.hwid, "trial": True})
     if trial_user:
         collection.delete_one({"hwid": req.hwid})
 
     now = now_ts()
-    # bind hwid if empty
     if not u.get("hwid"):
         collection.update_one(
             {"username": req.username},
@@ -331,10 +284,8 @@ def check_license(req: LicenseCheck):
             }}
         )
     else:
-        # check mismatch
         if u["hwid"] != req.hwid:
             return {"status": "invalid", "message": "HWID ไม่ตรง"}
-        # update online and ensure last_start_time exists
         upd = {"last_seen": now, "last_heartbeat": now}
         if not u.get("last_start_time"):
             upd["last_start_time"] = now
@@ -353,7 +304,6 @@ def request_trial(data: TrialRequestModel):
     now = now_ts()
     u = collection.find_one({"hwid": hwid})
 
-    # create new trial record if none exists
     if not u:
         tid = get_next_trial_id()
         username = f"TRIAL USER {tid}"
@@ -380,13 +330,10 @@ def request_trial(data: TrialRequestModel):
         collection.insert_one(doc)
         return {"status": "active", "username": username, "remaining": TRIAL_LIMIT_SEC}
 
-    # banned
     if u.get("banned"):
         return {"status": "banned", "remaining": 0}
 
-    # still in trial
     if u.get("trial"):
-        # compute elapsed including running session if any
         elapsed = int(u.get("total_usage_sec", 0) or 0)
         if u.get("last_start_time"):
             try:
@@ -426,7 +373,6 @@ def check_trial(data: HWIDModel):
 
     remaining = max(0, TRIAL_LIMIT_SEC - elapsed)
 
-    # online update (so admin shows online)
     collection.update_one(
         {"hwid": data.hwid},
         {"$set": {"last_seen": now, "last_heartbeat": now}}
@@ -454,10 +400,7 @@ def unban(data: HWIDModel):
     return {"status": "success"}
 
 # ============================================================
-# HEARTBEAT (counts time for active session if last_start_time present)
-#  - update last_seen/last_heartbeat immediately
-#  - if last_start_time exists we compute elapsed and add to total_usage_sec and reset last_start_time to now
-#  - keep opened_at/closed_at semantics (opened_at set when session starts, closed_at cleared while running)
+# HEARTBEAT (FIXED — ไม่บันทึก total_usage_sec ที่นี่)
 # ============================================================
 @app.post("/heartbeat")
 def heartbeat(data: HeartbeatModel):
@@ -467,37 +410,27 @@ def heartbeat(data: HeartbeatModel):
     if not u:
         return {"status": "fail", "reason": "user_not_found"}
 
-    # update online timestamps immediately
     collection.update_one(
         {"hwid": data.hwid},
         {"$set": {"last_seen": now, "last_heartbeat": now}}
     )
 
-    # re-fetch to read last_start_time and total_usage_sec
     u = collection.find_one({"hwid": data.hwid})
 
-    last_start = u.get("last_start_time")
-    if last_start:
-        try:
-            elapsed = now - int(last_start)
-            if elapsed < 0:
-                elapsed = 0
-        except Exception:
-            elapsed = 0
-        total_usage = int(u.get("total_usage_sec", 0) or 0) + elapsed
-
-        # update total_usage_sec and bump last_start_time to now (continue running session)
-        collection.update_one(
-            {"hwid": data.hwid},
-            {"$set": {"total_usage_sec": total_usage, "last_start_time": now, "opened_at": u.get("opened_at", now), "closed_at": None}}
-        )
-
-    # trial logic response
-    u = collection.find_one({"hwid": data.hwid})
     if u and u.get("trial"):
-        used = int(u.get("total_usage_sec", 0) or 0)
-        # if there's a running session, elapsed already added above; computed remaining:
-        remaining = max(0, TRIAL_LIMIT_SEC - used)
+        base_total = int(u.get("total_usage_sec", 0) or 0)
+        last_start = u.get("last_start_time")
+        
+        if last_start:
+            try:
+                elapsed = now - int(last_start)
+                live_total = base_total + max(0, elapsed)
+            except:
+                live_total = base_total
+        else:
+            live_total = base_total
+            
+        remaining = max(0, TRIAL_LIMIT_SEC - live_total)
         if remaining <= 0:
             return {"status": "expired", "remaining": 0}
         return {"status": "active", "remaining": remaining}
@@ -506,8 +439,6 @@ def heartbeat(data: HeartbeatModel):
 
 # ============================================================
 # START/STOP Trial Session
-#  - set opened_at when session starts; clear closed_at
-#  - on stop: compute elapsed, update total_usage_sec, set closed_at, append to session_history
 # ============================================================
 @app.post("/start_trial_session")
 def start_trial_session(data: HWIDModel):
@@ -516,7 +447,6 @@ def start_trial_session(data: HWIDModel):
     if not u or not u.get("trial"):
         raise HTTPException(status_code=404, detail="Trial ไม่พบ")
 
-    # If already running, do not reset last_start_time — just ensure opened_at set
     if u.get("last_start_time"):
         collection.update_one({"hwid": data.hwid}, {"$set": {"opened_at": u.get("opened_at", now), "closed_at": None}})
         return {"status": "already_running"}
@@ -540,29 +470,21 @@ def stop_trial_session(data: HWIDModel):
         except Exception:
             elapsed = 0
         total_usage = int(u.get("total_usage_sec", 0) or 0) + elapsed
-        # append session_history (use original u doc to avoid races)
         hist = u.get("session_history", []) or []
         hist = append_session_history(u, int(last_start), now)
-        # update accumulated usage and clear running flag
         collection.update_one(
             {"hwid": data.hwid},
             {"$set": {"total_usage_sec": total_usage, "last_start_time": None, "closed_at": now, "opened_at": u.get("opened_at")}}
         )
-        # update session_history separately to avoid race overwrite issues
         collection.update_one({"hwid": data.hwid}, {"$set": {"session_history": hist}})
-        # clean sessions older than retention window (e.g. 7 days)
         if u.get("username"):
             clean_old_sessions_for_user(u["username"], days=SESSION_HISTORY_RETENTION_DAYS)
     else:
-        # No running session — still ensure closed_at is set to now (idempotent)
         collection.update_one({"hwid": data.hwid}, {"$set": {"closed_at": now, "last_start_time": None}})
     return {"status": "stopped"}
 
 # ============================================================
 # START/STOP Licensed Session
-#  - same as trial but for licensed users
-#  - when starting, set opened_at if none; clear closed_at
-#  - when stopping, compute elapsed, append session, set closed_at
 # ============================================================
 @app.post("/start_session")
 def start_session(data: HWIDModel):
@@ -571,13 +493,10 @@ def start_session(data: HWIDModel):
     if not u:
         raise HTTPException(status_code=404, detail="User ไม่พบ")
 
-    # If session already running don't reset last_start_time (avoid erasing original start)
     if u.get("last_start_time"):
-        # ensure opened_at exists and closed_at cleared
         collection.update_one({"hwid": data.hwid}, {"$set": {"opened_at": u.get("opened_at", now), "closed_at": None}})
         return {"status": "already_running"}
 
-    # start new session
     collection.update_one({"hwid": data.hwid}, {"$set": {"last_start_time": now, "opened_at": now, "closed_at": None}})
     return {"status": "started"}
 
@@ -597,33 +516,24 @@ def stop_session(data: HWIDModel):
         except Exception:
             elapsed = 0
         total_usage = int(u.get("total_usage_sec", 0) or 0) + elapsed
-        # Build new history entry from the last_start we fetched from DB
         hist = u.get("session_history", []) or []
         hist = append_session_history(u, int(last_start), now)
-        # apply updates: accumulate usage, clear running flag, set closed_at
         collection.update_one(
             {"hwid": data.hwid},
             {"$set": {"total_usage_sec": total_usage, "last_start_time": None, "closed_at": now}}
         )
-        # store session_history separately to avoid overwrite races
         collection.update_one({"hwid": data.hwid}, {"$set": {"session_history": hist}})
-        # clean sessions older than retention window (e.g. 7 days)
         if u.get("username"):
             clean_old_sessions_for_user(u["username"], days=SESSION_HISTORY_RETENTION_DAYS)
     else:
-        # No running session found — idempotent set closed_at
         collection.update_one({"hwid": data.hwid}, {"$set": {"closed_at": now, "last_start_time": None}})
     return {"status": "stopped"}
 
 # ============================================================
-# Optional: endpoint to fetch logs (simple)
-#  - this endpoint can be used by Admin GUI to fetch human-readable logs
-#  - it compiles recent sessions for all users (last N entries)
+# LOGS
 # ============================================================
 @app.get("/logs")
 def logs(limit: int = 200):
-    """Return a simple logs view: recent session starts/stops and important events."""
-    # We'll create a simple list of events from session_history and created_at/license events.
     users = list(collection.find({}, {"username": 1, "session_history": 1, "created_at": 1, "license_activated_at": 1, "trial_started_at": 1, "banned": 1, "hwid": 1, "_id": 0}))
     events = []
     for u in users:
@@ -639,22 +549,16 @@ def logs(limit: int = 200):
         for s in (u.get("session_history") or [])[-10:]:
             events.append({"ts": int(s.get("start")), "type": "session_start", "username": username, "hwid": hwid})
             events.append({"ts": int(s.get("end")), "type": "session_end", "username": username, "hwid": hwid})
-    # sort events by ts desc
     events_sorted = sorted(events, key=lambda x: x["ts"], reverse=True)[:limit]
-    # human readable mapping
     for e in events_sorted:
         e["time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["ts"]))
     return {"events": events_sorted}
 
 # ============================================================
-# NEW: user session history endpoint (time-filtered)
+# USER SESSION HISTORY
 # ============================================================
 @app.get("/user_session_history")
 def user_session_history(username: str, days: int = SESSION_HISTORY_RETENTION_DAYS):
-    """
-    Return session entries for a user filtered by a retention window (days).
-    Default days uses SESSION_HISTORY_RETENTION_DAYS.
-    """
     cutoff = now_ts() - (days * 24 * 60 * 60)
     u = collection.find_one({"username": username}, {"session_history": 1, "_id": 0})
     if not u:
@@ -665,12 +569,11 @@ def user_session_history(username: str, days: int = SESSION_HISTORY_RETENTION_DA
         for s in hist
         if s.get("end", 0) >= cutoff
     ]
-    # return newest first
     filtered_sorted = sorted(filtered, key=lambda x: x["start"], reverse=True)
     return {"history": filtered_sorted}
 
 # ============================================================
-# NEW: Clear logs endpoints
+# CLEAR LOGS
 # ============================================================
 @app.post("/clear_user_logs")
 def clear_user_logs(payload: UsernameModel):
@@ -694,7 +597,3 @@ def clear_logs_days(payload: DaysModel):
         if len(new_hist) != len(hist):
             collection.update_one({"username": u["username"]}, {"$set": {"session_history": new_hist}})
     return {"status": "ok", "message": f"Cleared sessions older than {days} days"}
-
-# ============================================================
-# End of file
-# ============================================================
